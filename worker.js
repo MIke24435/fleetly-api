@@ -23,6 +23,105 @@ const SKILLS = {
 
 const LICENSE_MSG = "This Fleetly install needs a valid license key. Your key goes in the 'Fleetly license key' field on your Fleetly home page in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
 
+// ---- Stripe webhook: automatic license issuance ----
+function makeLicenseKey() {
+  const bytes = crypto.getRandomValues(new Uint8Array(10));
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no confusing chars
+  let s = "";
+  for (const b of bytes) s += alphabet[b % alphabet.length];
+  return "FL-" + s.slice(0, 5) + "-" + s.slice(5);
+}
+
+async function verifyStripeSig(rawBody, sigHeader, secret) {
+  if (!sigHeader || !secret) return false;
+  const parts = {};
+  for (const p of sigHeader.split(",")) {
+    const i = p.indexOf("=");
+    if (i > 0) parts[p.slice(0, i).trim()] = p.slice(i + 1).trim();
+  }
+  if (!parts.t || !parts.v1) return false;
+  // Reject events older than 5 minutes (replay protection)
+  if (Math.abs(Date.now() / 1000 - parseInt(parts.t, 10)) > 300) return false;
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign(
+    "HMAC", key, new TextEncoder().encode(parts.t + "." + rawBody));
+  const hex = [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, "0")).join("");
+  return timedEqual(hex, parts.v1);
+}
+function timedEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+async function handleStripeWebhook(request, env) {
+  const sig = request.headers.get("stripe-signature");
+  const rawBody = await request.text();
+  if (!await verifyStripeSig(rawBody, sig, env.STRIPE_WEBHOOK_SECRET)) {
+    return json({ ok: false, error: "bad_signature" }, 400);
+  }
+  let event;
+  try { event = JSON.parse(rawBody); } catch (e) { return json({ ok: false }, 400); }
+
+  // Idempotency: Stripe retries deliveries; never issue twice for one event.
+  if (env.LICENSES) {
+    const seen = await env.LICENSES.get("stripe-event:" + event.id);
+    if (seen) return json({ ok: true, deduped: true });
+  }
+
+  const type = event.type;
+  const obj = event.data && event.data.object ? event.data.object : {};
+
+  if (type === "checkout.session.completed") {
+    const email = (obj.customer_details && obj.customer_details.email) || obj.customer_email || "";
+    const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
+    const key = makeLicenseKey();
+    const record = {
+      email: email,
+      status: "active",
+      created: new Date().toISOString().split("T")[0],
+      plan: mode === "subscription" ? "membership" : "template",
+      stripe_session: obj.id,
+      stripe_customer: obj.customer || "",
+    };
+    if (env.LICENSES) {
+      await env.LICENSES.put("license:" + key, JSON.stringify(record));
+      await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+      // Lookup by email for manual delivery / support
+      if (email) await env.LICENSES.put("license-email:" + email.toLowerCase(), key);
+      // Lookup by Stripe customer id for subscription cancellation
+      if (record.stripe_customer) await env.LICENSES.put("license-customer:" + record.stripe_customer, key);
+    }
+    // v1: key is stored; Mike emails it to the buyer manually.
+    // (Automated delivery email is the next step.)
+    return json({ ok: true, issued: true });
+  }
+
+  if (type === "customer.subscription.deleted") {
+    // $6/mo cancelled: find the license by customer and deactivate it.
+    const customer = obj.customer || "";
+    if (env.LICENSES && customer) {
+      // We stored stripe_customer on the record; scan is not possible in KV,
+      // so we keep a customer->key index at issuance time (see below).
+      const key = await env.LICENSES.get("license-customer:" + customer);
+      if (key) {
+        const rec = await env.LICENSES.get("license:" + key, "json");
+        if (rec) {
+          rec.status = "cancelled";
+          await env.LICENSES.put("license:" + key, JSON.stringify(rec));
+        }
+      }
+    }
+    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+    return json({ ok: true });
+  }
+
+  return json({ ok: true, ignored: type });
+}
+
 function json(data, status) {
   return new Response(JSON.stringify(data), {
     status: status || 200,
@@ -42,6 +141,11 @@ export default {
 
     if (path === "/api/health" || path === "/") {
       return json({ ok: true, service: "fleetly-api" });
+    }
+
+    if (path === "/api/stripe-webhook") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleStripeWebhook(request, env);
     }
 
     const m = path.match(/^\/api\/skills\/([a-z0-9-]+)$/);
