@@ -250,7 +250,11 @@ async function syncSkillsFromRegistry(env) {
       if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
       // De-Mike: buyer-facing text uses "the user", never "Mike".
       const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
+      const version = text("Version").trim();
+      const updated = text("Updated").trim();
       await env.LICENSES.put("skill:" + trigger, clean);
+      if (version) await env.LICENSES.put("skill-version:" + trigger, version);
+      if (updated) await env.LICENSES.put("skill-updated:" + trigger, updated);
       synced++;
     }
     cursor = j.has_more ? j.next_cursor : null;
@@ -602,7 +606,13 @@ export default {
       }
       if (!skill) skill = SKILLS[trigger];
       if (!skill) return json({ ok: false, error: "not_found" }, 404);
-      return json({ ok: true, trigger: trigger, instructions: skill });
+      let version = null;
+      if (env.LICENSES) {
+        try { version = await env.LICENSES.get("skill-version:" + trigger); } catch (e) {}
+      }
+      const resp = { ok: true, trigger: trigger, instructions: skill };
+      if (version) resp.version = version;
+      return json(resp);
     }
 
     return json({ ok: false, error: "not_found" }, 404);
