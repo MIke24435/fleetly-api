@@ -152,8 +152,9 @@ async function handleTicketNotify(request, env) {
   const buyerField = rich("Buyer");
   const buyerEmail = (buyerField.match(/[^\s()]+@[^\s()]+/) || [""])[0];
   const resolution = rich("Resolution");
-  const status = (props.Status && props.Status.select && props.Status.select.name) || "";
-  if (!buyerEmail || !resolution) return json({ ok: false, error: "missing_email_or_resolution" }, 400);
+  const customMessage = (body.message || "").trim().slice(0, 2000);
+  if (!buyerEmail) return json({ ok: false, error: "missing_email" }, 400);
+  if (!resolution && !customMessage) return json({ ok: false, error: "missing_resolution_or_message" }, 400);
 
   try {
     const r = await fetch("https://api.resend.com/emails", {
@@ -165,11 +166,15 @@ async function handleTicketNotify(request, env) {
       body: JSON.stringify({
         from: "Fleetly <hello@fleetlybots.com>",
         to: [buyerEmail],
-        subject: "Your Fleetly support ticket " + ticketNo + " is resolved",
-        html: "<p>Good news — your support ticket <strong>" + ticketNo + "</strong> (" + title.replace(/</g, "&lt;") + ") is resolved.</p>"
-          + "<p><strong>Resolution:</strong></p><p>" + resolution.replace(/</g, "&lt;").replace(/\n/g, "<br>") + "</p>"
-          + "<p>If this doesn't solve it, just reply to this email.</p>"
-          + "<p>— The Fleetly team</p>",
+        subject: customMessage ? "Update on your Fleetly support ticket " + ticketNo : "Your Fleetly support ticket " + ticketNo + " is resolved",
+        html: customMessage
+          ? "<p>An update on your support ticket <strong>" + ticketNo + "</strong> (" + title.replace(/</g, "&lt;") + "):</p>"
+            + "<p>" + customMessage.replace(/</g, "&lt;").replace(/\n/g, "<br>") + "</p>"
+            + "<p>— The Fleetly team</p>"
+          : "<p>Good news — your support ticket <strong>" + ticketNo + "</strong> (" + title.replace(/</g, "&lt;") + ") is resolved.</p>"
+            + "<p><strong>Resolution:</strong></p><p>" + resolution.replace(/</g, "&lt;").replace(/\n/g, "<br>") + "</p>"
+            + "<p>If this doesn't solve it, just reply to this email.</p>"
+            + "<p>— The Fleetly team</p>",
       }),
     });
     if (!r.ok) return json({ ok: false, error: "email_failed" }, 502);
