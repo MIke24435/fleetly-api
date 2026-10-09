@@ -57,6 +57,45 @@ function timedEqual(a, b) {
   return d === 0;
 }
 
+async function sendKeyEmail(env, email, key, plan) {
+  if (!env.RESEND_API_KEY || !email) return { sent: false, reason: "no_api_key_or_email" };
+  const productLine = plan === "membership"
+    ? "Fleetly membership — ongoing updates ($6/month)"
+    : "Fleetly custom Notion template ($49, includes 6 months of updates)";
+  const html = `
+    <p>Your Fleetly license key is ready:</p>
+    <p style="font-size:20px;font-weight:bold;letter-spacing:2px;">${key}</p>
+    <p><strong>What you bought:</strong> ${productLine}</p>
+    <p><strong>Setup (3 steps):</strong></p>
+    <ol>
+      <li>Duplicate the Fleetly template into your Notion (link below).</li>
+      <li>Paste your key into the "Fleetly license key" field on your Fleetly home page.</li>
+      <li>Tell your AI assistant to fetch its instructions — it will use your key automatically.</li>
+    </ol>
+    <p>Template: https://fleetlybots.com/setup</p>
+    <p>Questions? Reply to this email.</p>
+    <p>— The Fleetly team</p>`;
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.RESEND_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Fleetly <hello@fleetlybots.com>",
+        to: [email],
+        subject: "Your Fleetly license key",
+        html: html,
+      }),
+    });
+    if (!r.ok) return { sent: false, reason: "resend_" + r.status };
+    return { sent: true };
+  } catch (e) {
+    return { sent: false, reason: "fetch_error" };
+  }
+}
+
 async function handleStripeWebhook(request, env) {
   const sig = request.headers.get("stripe-signature");
   const rawBody = await request.text();
@@ -95,9 +134,14 @@ async function handleStripeWebhook(request, env) {
       // Lookup by Stripe customer id for subscription cancellation
       if (record.stripe_customer) await env.LICENSES.put("license-customer:" + record.stripe_customer, key);
     }
-    // v1: key is stored; Mike emails it to the buyer manually.
-    // (Automated delivery email is the next step.)
-    return json({ ok: true, issued: true });
+    // Deliver the key by email (automatic). Key issuance above already
+    // succeeded, so a mail failure never blocks the license itself.
+    const mail = await sendKeyEmail(env, email, key, record.plan);
+    if (env.LICENSES && !mail.sent) {
+      await env.LICENSES.put("license-email-pending:" + key,
+        JSON.stringify({ email: email, reason: mail.reason }));
+    }
+    return json({ ok: true, issued: true, email_sent: mail.sent });
   }
 
   if (type === "customer.subscription.deleted") {
