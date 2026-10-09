@@ -58,13 +58,14 @@ async function handleTicket(request, env) {
   const today = new Date().toISOString().split("T")[0];
   const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
 
-  // Sequential ticket number (FLT-0001, FLT-0002, ...).
+  // Sequential ticket number (FLT-0001, FLT-0002, ...), prefixed to the title.
   let ticketNo = "";
   if (env.LICENSES) {
     const n = parseInt(await env.LICENSES.get("ticket-counter") || "0", 10) + 1;
     await env.LICENSES.put("ticket-counter", String(n));
     ticketNo = "FLT-" + String(n).padStart(4, "0");
   }
+  const fullTitle = ticketNo ? ticketNo + " — " + title : title;
 
   // Write the ticket into the administrator's Notion database.
   if (!env.NOTION_TOKEN) return json({ ok: false, error: "tickets_unavailable" }, 503);
@@ -79,8 +80,7 @@ async function handleTicket(request, env) {
       body: JSON.stringify({
         parent: { type: "data_source_id", data_source_id: TICKETS_DB },
         properties: {
-          "Ticket": { title: [{ text: { content: title } }] },
-          "Ticket No": { rich_text: [{ text: { content: ticketNo } }] },
+          "Ticket": { title: [{ text: { content: fullTitle } }] },
           "Status": { select: { name: "Inbox" } },
           "Buyer": { rich_text: [{ text: { content: (lic.email || "") + (lic.name ? " (" + lic.name + ")" : "") } }] },
           "License key": { rich_text: [{ text: { content: key } }] },
