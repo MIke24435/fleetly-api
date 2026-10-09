@@ -383,6 +383,45 @@ async function handleStripeWebhook(request, env) {
     return json({ ok: true, revoked: !!record });
   }
 
+  if (type === "customer.subscription.updated" && obj.cancel_at_period_end && obj.status === "active") {
+    // Membership cancelled but runs to period end: confirm immediately.
+    const customer = obj.customer || "";
+    let key = "";
+    let email = "";
+    if (env.LICENSES && customer) {
+      key = await env.LICENSES.get("license-customer:" + customer);
+      if (key) {
+        const rec = await env.LICENSES.get("license:" + key, "json");
+        if (rec) email = rec.email || "";
+      }
+    }
+    const periodEnd = obj.cancel_at
+      ? new Date(obj.cancel_at * 1000).toISOString().split("T")[0] : "";
+    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+    if (email && env.RESEND_API_KEY) {
+      try {
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + env.RESEND_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            from: "Fleetly <hello@fleetlybots.com>",
+            to: [email],
+            subject: "Your Fleetly membership is cancelled",
+            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
+              + (periodEnd ? `<p>It stays active through <strong>${periodEnd}</strong>.</p>` : "")
+              + (key ? `<p>Your license key <strong>${key}</strong> keeps working after that: your template and core skills are yours, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
+              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
+              + `<p>— The Fleetly team</p>`,
+          }),
+        });
+      } catch (e) { /* cancellation stands even if the email fails */ }
+    }
+    return json({ ok: true, cancel_scheduled: true });
+  }
+
   if (type === "customer.subscription.deleted") {
     // $6/mo cancelled: find the license by customer and deactivate it.
     const customer = obj.customer || "";
