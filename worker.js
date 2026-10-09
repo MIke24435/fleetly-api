@@ -240,6 +240,11 @@ async function syncSkillsFromRegistry(env) {
       let trigger = text("Trigger").trim().replace(/:$/, "").replace(/\s+/g, "-").toLowerCase();
       const instructions = text("Instructions").trim();
       const appliesTo = text("Applies to").trim().toLowerCase();
+      // Draft checkbox (or Draft in the name) means not ready — skip it.
+      const draftProp = props["Draft"];
+      const isDraft = (draftProp && draftProp.checkbox === true)
+        || /\bdraft\b/i.test(skill);
+      if (isDraft) continue;
       // Only sync user-facing skills with real instructions.
       if (!trigger || !instructions || instructions.length < 20) continue;
       if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
