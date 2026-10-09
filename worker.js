@@ -128,7 +128,7 @@ async function handleTicketNotify(request, env) {
   // Find the ticket in Notion by number.
   let page = null;
   try {
-    const q = await fetch("https://api.notion.com/v1/data_sources/" + TICKETS_DB + "/query", {
+    const q = await fetch("https://api.notion.com/v1/databases/a9b6f458-a3e5-4664-8780-c85d3cc6a237/query", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.NOTION_TOKEN,
