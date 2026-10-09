@@ -34,6 +34,78 @@ const SKILLS = {
 
 const LICENSE_MSG = "This Fleetly install needs a valid license key. Your key goes in the 'Fleetly license key' field on your Fleetly home page in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
 
+// ---- Support tickets: buyer files a ticket, row lands in the
+// administrator's Notion "Support Tickets" database ----
+const TICKETS_DB = "488a9ed1-a9a3-48df-bd4f-7101d9786690";
+
+async function handleTicket(request, env) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const key = (body.key || "").trim();
+  const problem = (body.problem || "").trim();
+  if (!key || !problem) return json({ ok: false, error: "key_and_problem_required" }, 400);
+  if (problem.length > 2000) return json({ ok: false, error: "problem_too_long" }, 400);
+
+  // Validate the license key (any active or honeymoon-expired key may file).
+  let lic = null;
+  if (env.LICENSES) {
+    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
+  }
+  if (!lic) return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+
+  const today = new Date().toISOString().split("T")[0];
+  const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
+
+  // Write the ticket into the administrator's Notion database.
+  if (!env.NOTION_TOKEN) return json({ ok: false, error: "tickets_unavailable" }, 503);
+  try {
+    const r = await fetch("https://api.notion.com/v1/pages", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.NOTION_TOKEN,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        parent: { database_id: TICKETS_DB },
+        properties: {
+          "Ticket": { title: [{ text: { content: title } }] },
+          "Status": { select: { name: "Inbox" } },
+          "Buyer": { rich_text: [{ text: { content: (lic.email || "") + (lic.name ? " (" + lic.name + ")" : "") } }] },
+          "License key": { rich_text: [{ text: { content: key } }] },
+          "Problem": { rich_text: [{ text: { content: problem } }] },
+          "Date opened": { date: { start: today } },
+        },
+      }),
+    });
+    if (!r.ok) return json({ ok: false, error: "notion_write_failed" }, 502);
+  } catch (e) {
+    return json({ ok: false, error: "notion_write_failed" }, 502);
+  }
+
+  // Notify the administrator by email.
+  if (env.RESEND_API_KEY) {
+    try {
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + env.RESEND_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: "Fleetly <hello@fleetlybots.com>",
+          to: ["fleetlybots@gmail.com"],
+          subject: "New Fleetly support ticket",
+          html: "<p><strong>Buyer:</strong> " + (lic.email || key) + "</p>"
+            + "<p><strong>Problem:</strong></p><p>" + problem.replace(/</g, "&lt;") + "</p>",
+        }),
+      });
+    } catch (e) { /* ticket is filed; the email is a courtesy */ }
+  }
+
+  return json({ ok: true, filed: true });
+}
+
 // ---- Stripe webhook: automatic license issuance ----
 function makeLicenseKey() {
   const bytes = crypto.getRandomValues(new Uint8Array(10));
@@ -242,6 +314,11 @@ export default {
 
     if (path === "/api/health" || path === "/") {
       return json({ ok: true, service: "fleetly-api" });
+    }
+
+    if (path === "/api/tickets") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleTicket(request, env);
     }
 
     if (path === "/api/stripe-webhook") {
