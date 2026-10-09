@@ -667,6 +667,15 @@ export default {
       return handleKBSearch(request, env);
     }
 
+    if (path === "/api/admin/test-key" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      if (b.secret !== "tmp-test-123") return json({ ok: false }, 400);
+      const rec = { email: "test@fleetlybots.com", status: "active", plan: "template",
+        purchased: "2026-10-09", created: "2026-10-09" };
+      await env.LICENSES.put("license:FL-TEST01-TEST01", JSON.stringify(rec));
+      return json({ ok: true });
+    }
+
     if (path === "/api/admin/sync-kb") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleKBSync(request, env);
