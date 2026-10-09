@@ -5,3 +5,6 @@ compatibility_date = "2026-10-08"
 [[kv_namespaces]]
 binding = "LICENSES"
 id = "1a030ff13c794e6fac854a8cb94cdb55"
+
+[triggers]
+crons = ["0 * * * *"]

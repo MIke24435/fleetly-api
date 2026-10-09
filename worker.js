@@ -207,6 +207,60 @@ async function handleTicketNotify(request, env) {
   return json({ ok: true, notified: buyerEmail, ticket: ticketNo });
 }
 
+// ---- Skill sync: pull from the administrator's Notion registry into KV ----
+const REGISTRY_DB = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
+async function syncSkillsFromRegistry(env) {
+  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+  let cursor = null;
+  let synced = 0;
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const r = await fetch("https://api.notion.com/v1/databases/4de82984-9fc8-4ee5-b269-4d5d22398504/query", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.NOTION_TOKEN,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
+    const j = await r.json();
+    for (const page of (j.results || [])) {
+      const props = page.properties || {};
+      const text = (p) => {
+        const v = props[p];
+        if (!v) return "";
+        if (v.title) return v.title.map(x => x.plain_text).join("");
+        if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
+        return "";
+      };
+      const skill = text("Skill").trim();
+      let trigger = text("Trigger").trim().replace(/:$/, "").replace(/\s+/g, "-").toLowerCase();
+      const instructions = text("Instructions").trim();
+      const appliesTo = text("Applies to").trim().toLowerCase();
+      // Only sync user-facing skills with real instructions.
+      if (!trigger || !instructions || instructions.length < 20) continue;
+      if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
+      // De-Mike: buyer-facing text uses "the user", never "Mike".
+      const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
+      await env.LICENSES.put("skill:" + trigger, clean);
+      synced++;
+    }
+    cursor = j.has_more ? j.next_cursor : null;
+  } while (cursor);
+  await env.LICENSES.put("skill-sync:last", new Date().toISOString());
+  return { ok: true, synced: synced };
+}
+
+async function handleSkillSync(request, env) {
+  const auth = request.headers.get("x-admin-secret") || "";
+  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
+    return json({ ok: false, error: "unauthorized" }, 401);
+  return json(await syncSkillsFromRegistry(env));
+}
+
 // ---- Stripe webhook: automatic license issuance ----
 function makeLicenseKey() {
   const bytes = crypto.getRandomValues(new Uint8Array(10));
@@ -497,6 +551,11 @@ export default {
       return handleTicket(request, env);
     }
 
+    if (path === "/api/admin/sync-skills") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleSkillSync(request, env);
+    }
+
     if (path === "/api/tickets/notify") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleTicketNotify(request, env);
@@ -531,11 +590,21 @@ export default {
             message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
         }
       }
-      const skill = SKILLS[trigger];
+      // KV-synced skills take priority; hardcoded SKILLS is the fallback.
+      let skill = null;
+      if (env.LICENSES) {
+        try { skill = await env.LICENSES.get("skill:" + trigger); } catch (e) {}
+      }
+      if (!skill) skill = SKILLS[trigger];
       if (!skill) return json({ ok: false, error: "not_found" }, 404);
       return json({ ok: true, trigger: trigger, instructions: skill });
     }
 
     return json({ ok: false, error: "not_found" }, 404);
+  },
+
+  async scheduled(event, env, ctx) {
+    // Hourly: pull fresh skills from the administrator's registry.
+    ctx.waitUntil(syncSkillsFromRegistry(env));
   },
 };
