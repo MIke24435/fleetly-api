@@ -57,12 +57,15 @@ function timedEqual(a, b) {
   return d === 0;
 }
 
-async function sendKeyEmail(env, email, key, plan) {
+async function sendKeyEmail(env, email, key, plan, isNew) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: "no_api_key_or_email" };
+  const isMembershipRenewal = plan === "membership" && !isNew;
   const productLine = plan === "membership"
     ? "Fleetly membership — ongoing updates ($6/month)"
     : "Fleetly custom Notion template ($49, includes 6 months of updates)";
-  const html = `
+  const html = isMembershipRenewal ? `
+    <p>Your Fleetly membership is active — your license now stays current as long as you're subscribed. No new key needed; keep using <strong>${key}</strong>.</p>
+    <p>— The Fleetly team</p>` : `
     <p>Your Fleetly license key is ready:</p>
     <p style="font-size:20px;font-weight:bold;letter-spacing:2px;">${key}</p>
     <p><strong>What you bought:</strong> ${productLine}</p>
@@ -85,7 +88,7 @@ async function sendKeyEmail(env, email, key, plan) {
       body: JSON.stringify({
         from: "Fleetly <hello@fleetlybots.com>",
         to: [email],
-        subject: "Your Fleetly license key",
+        subject: isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key",
         html: html,
       }),
     });
@@ -118,27 +121,46 @@ async function handleStripeWebhook(request, env) {
     const email = (obj.customer_details && obj.customer_details.email) || obj.customer_email || "";
     const name = (obj.customer_details && obj.customer_details.name) || "";
     const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
-    const key = makeLicenseKey();
-    const record = {
-      email: email,
-      name: name,
-      status: "active",
-      created: new Date().toISOString().split("T")[0],
-      plan: mode === "subscription" ? "membership" : "template",
-      stripe_session: obj.id,
-      stripe_customer: obj.customer || "",
-    };
+    const today = new Date().toISOString().split("T")[0];
+    const sixMonths = new Date(Date.now() + 182 * 86400 * 1000).toISOString().split("T")[0];
+    // One key per buyer: look up any existing license by email first.
+    let key = "";
+    let record = null;
+    let isNew = false;
+    if (env.LICENSES && email) {
+      key = await env.LICENSES.get("license-email:" + email.toLowerCase());
+      if (key) record = await env.LICENSES.get("license:" + key, "json");
+    }
+    if (!record) {
+      key = makeLicenseKey();
+      record = { email: email, name: name, status: "active", created: today,
+        purchased: today, stripe_customer: obj.customer || "" };
+      isNew = true;
+    }
+    record.email = email || record.email;
+    if (name) record.name = name;
+    if (obj.customer) record.stripe_customer = obj.customer;
+    record.status = "active";
+    if (mode === "subscription") {
+      // Membership: no expiry while subscribed.
+      record.plan = "membership";
+      record.expires = null;
+    } else {
+      // Template: 6 months of updates from purchase.
+      record.plan = "template";
+      record.purchased = today;
+      record.expires = sixMonths;
+    }
+    record.stripe_session = obj.id;
     if (env.LICENSES) {
       await env.LICENSES.put("license:" + key, JSON.stringify(record));
       await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-      // Lookup by email for manual delivery / support
       if (email) await env.LICENSES.put("license-email:" + email.toLowerCase(), key);
-      // Lookup by Stripe customer id for subscription cancellation
       if (record.stripe_customer) await env.LICENSES.put("license-customer:" + record.stripe_customer, key);
     }
     // Deliver the key by email (automatic). Key issuance above already
     // succeeded, so a mail failure never blocks the license itself.
-    const mail = await sendKeyEmail(env, email, key, record.plan);
+    const mail = await sendKeyEmail(env, email, key, record.plan, isNew);
     if (env.LICENSES && !mail.sent) {
       await env.LICENSES.put("license-email-pending:" + key,
         JSON.stringify({ email: email, reason: mail.reason }));
@@ -157,7 +179,13 @@ async function handleStripeWebhook(request, env) {
         const rec = await env.LICENSES.get("license:" + key, "json");
         if (rec) {
           email = rec.email || "";
-          rec.status = "cancelled";
+          // Fall back to the template's 6-month window from original purchase.
+          // If that already passed, the key is effectively expired.
+          rec.plan = "template";
+          rec.status = "active";
+          const purchased = rec.purchased || rec.created || "2026-10-09";
+          rec.expires = new Date(new Date(purchased).getTime() + 182 * 86400 * 1000)
+            .toISOString().split("T")[0];
           await env.LICENSES.put("license:" + key, JSON.stringify(rec));
         }
       }
@@ -225,6 +253,10 @@ export default {
       }
       if (!lic || lic.status !== "active") {
         return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+      }
+      if (lic.expires && lic.expires < new Date().toISOString().split("T")[0]) {
+        return json({ ok: false, error: "expired",
+          message: "This Fleetly license's update period has ended. Add the Fleetly membership at https://fleetlybots.com/#pricing to keep going." }, 403);
       }
       const skill = SKILLS[m[1]];
       if (!skill) return json({ ok: false, error: "not_found" }, 404);
