@@ -89,7 +89,7 @@ async function handleTicket(request, env) {
         },
       }),
     });
-    if (!r.ok) { const eb = await r.text(); return json({ ok: false, error: "notion_write_failed", detail: eb.slice(0, 300), status: r.status }, 502); }
+    if (!r.ok) return json({ ok: false, error: "notion_write_failed" }, 502);
   } catch (e) {
     return json({ ok: false, error: "notion_write_failed" }, 502);
   }
