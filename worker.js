@@ -179,6 +179,27 @@ async function handleTicketNotify(request, env) {
     });
     if (!r.ok) return json({ ok: false, error: "email_failed" }, 502);
   } catch (e) { return json({ ok: false, error: "email_failed" }, 502); }
+
+  // Log the message on the ticket page as administrator-feedback history.
+  try {
+    const now = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    const logText = customMessage
+      ? "[" + now + "] Administrator update sent: " + customMessage
+      : "[" + now + "] Resolution email sent: " + resolution;
+    await fetch("https://api.notion.com/v1/blocks/" + page.id + "/children", {
+      method: "PATCH",
+      headers: {
+        "Authorization": "Bearer " + env.NOTION_TOKEN,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        children: [{ object: "block", type: "paragraph",
+          paragraph: { rich_text: [{ type: "text", text: { content: logText.slice(0, 2000) } }] } }],
+      }),
+    });
+  } catch (e) { /* history is a courtesy */ }
+
   return json({ ok: true, notified: buyerEmail, ticket: ticketNo });
 }
 
