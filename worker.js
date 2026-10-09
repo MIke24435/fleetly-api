@@ -116,10 +116,12 @@ async function handleStripeWebhook(request, env) {
 
   if (type === "checkout.session.completed") {
     const email = (obj.customer_details && obj.customer_details.email) || obj.customer_email || "";
+    const name = (obj.customer_details && obj.customer_details.name) || "";
     const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
     const key = makeLicenseKey();
     const record = {
       email: email,
+      name: name,
       status: "active",
       created: new Date().toISOString().split("T")[0],
       plan: mode === "subscription" ? "membership" : "template",
