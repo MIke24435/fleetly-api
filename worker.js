@@ -117,6 +117,66 @@ async function handleTicket(request, env) {
   return json({ ok: true, filed: true, ticket: ticketNo });
 }
 
+// ---- Ticket resolution email: notify the buyer when their ticket is closed ----
+async function handleTicketNotify(request, env) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const ticketNo = (body.ticket || "").trim().toUpperCase();
+  if (!ticketNo) return json({ ok: false, error: "ticket_required" }, 400);
+  if (!env.NOTION_TOKEN || !env.RESEND_API_KEY) return json({ ok: false, error: "not_configured" }, 503);
+
+  // Find the ticket in Notion by number.
+  let page = null;
+  try {
+    const q = await fetch("https://api.notion.com/v1/data_sources/" + TICKETS_DB + "/query", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.NOTION_TOKEN,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        filter: { property: "Ticket", title: { contains: ticketNo } },
+        page_size: 1,
+      }),
+    });
+    if (!q.ok) return json({ ok: false, error: "notion_query_failed" }, 502);
+    const qj = await q.json();
+    page = (qj.results && qj.results[0]) || null;
+  } catch (e) { return json({ ok: false, error: "notion_query_failed" }, 502); }
+  if (!page) return json({ ok: false, error: "ticket_not_found" }, 404);
+
+  const props = page.properties || {};
+  const rich = (p) => (props[p] && props[p].rich_text || []).map(x => x.plain_text).join("");
+  const title = (props.Ticket && props.Ticket.title || []).map(x => x.plain_text).join("");
+  const buyerField = rich("Buyer");
+  const buyerEmail = (buyerField.match(/[^\s()]+@[^\s()]+/) || [""])[0];
+  const resolution = rich("Resolution");
+  const status = (props.Status && props.Status.select && props.Status.select.name) || "";
+  if (!buyerEmail || !resolution) return json({ ok: false, error: "missing_email_or_resolution" }, 400);
+
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.RESEND_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Fleetly <hello@fleetlybots.com>",
+        to: [buyerEmail],
+        subject: "Your Fleetly support ticket " + ticketNo + " is resolved",
+        html: "<p>Good news — your support ticket <strong>" + ticketNo + "</strong> (" + title.replace(/</g, "&lt;") + ") is resolved.</p>"
+          + "<p><strong>Resolution:</strong></p><p>" + resolution.replace(/</g, "&lt;").replace(/\n/g, "<br>") + "</p>"
+          + "<p>If this doesn't solve it, just reply to this email.</p>"
+          + "<p>— The Fleetly team</p>",
+      }),
+    });
+    if (!r.ok) return json({ ok: false, error: "email_failed" }, 502);
+  } catch (e) { return json({ ok: false, error: "email_failed" }, 502); }
+  return json({ ok: true, notified: buyerEmail, ticket: ticketNo });
+}
+
 // ---- Stripe webhook: automatic license issuance ----
 function makeLicenseKey() {
   const bytes = crypto.getRandomValues(new Uint8Array(10));
@@ -330,6 +390,11 @@ export default {
     if (path === "/api/tickets") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleTicket(request, env);
+    }
+
+    if (path === "/api/tickets/notify") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleTicketNotify(request, env);
     }
 
     if (path === "/api/stripe-webhook") {
