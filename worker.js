@@ -207,6 +207,101 @@ async function handleTicketNotify(request, env) {
   return json({ ok: true, notified: buyerEmail, ticket: ticketNo });
 }
 
+// ---- KB search: query published knowledge base articles ----
+const CONTENT_DB = "00942471-34fa-49fe-af64-ea9356313b7f";
+const CONTENT_PAGE = "9ac7f508a8144300b7a967946fd7b41f";
+async function syncKBFromNotion(env) {
+  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+  const r = await fetch("https://api.notion.com/v1/databases/" + CONTENT_PAGE + "/query", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + env.NOTION_TOKEN,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      filter: { property: "Status", select: { equals: "Published" } },
+      page_size: 100,
+    }),
+  });
+  if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
+  const j = await r.json();
+  let synced = 0;
+  const index = [];
+  for (const page of (j.results || [])) {
+    const props = page.properties || {};
+    const text = (p) => {
+      const v = props[p];
+      if (!v) return "";
+      if (v.title) return v.title.map(x => x.plain_text).join("");
+      if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
+      return "";
+    };
+    const title = text("Title").trim();
+    const body = text("Body").trim();
+    const keywords = text("Keywords").trim().toLowerCase();
+    const type = (props.Type && props.Type.select && props.Type.select.name) || "";
+    if (!title || !body) continue;
+    const id = page.id.replace(/-/g, "").slice(0, 8);
+    const article = { id: id, title: title, type: type, body: body, keywords: keywords };
+    await env.LICENSES.put("kb:" + id, JSON.stringify(article));
+    index.push({ id: id, title: title, keywords: keywords + " " + title.toLowerCase() });
+    synced++;
+  }
+  await env.LICENSES.put("kb:index", JSON.stringify(index));
+  await env.LICENSES.put("kb-sync:last", new Date().toISOString());
+  return { ok: true, synced: synced };
+}
+
+async function handleKBSearch(request, env) {
+  const url = new URL(request.url);
+  const key = (url.searchParams.get("key") || "").trim();
+  const query = (url.searchParams.get("q") || "").trim().toLowerCase();
+  if (!query) return json({ ok: false, error: "query_required" }, 400);
+  // License check (same as skills).
+  let lic = null;
+  if (env.LICENSES && key) {
+    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) {}
+  }
+  if (!lic || lic.status === "refunded" || lic.status === "disputed" || lic.status === "deactivated")
+    return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+
+  let index = [];
+  try {
+    const idxRaw = await env.LICENSES.get("kb:index");
+    if (idxRaw) index = JSON.parse(idxRaw);
+  } catch (e) {}
+  const terms = query.split(/\s+/).filter(w => w.length > 2);
+  const scored = [];
+  for (const entry of index) {
+    let score = 0;
+    for (const term of terms) {
+      if (entry.keywords.includes(term)) score += 2;
+      if (entry.title.toLowerCase().includes(term)) score += 3;
+    }
+    if (score > 0) scored.push({ entry: entry, score: score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const results = [];
+  for (const s of scored.slice(0, 3)) {
+    try {
+      const raw = await env.LICENSES.get("kb:" + s.entry.id);
+      if (raw) {
+        const a = JSON.parse(raw);
+        results.push({ title: a.title, type: a.type, body: a.body.slice(0, 800) });
+      }
+    } catch (e) {}
+  }
+  return json({ ok: true, query: query, results: results });
+}
+
+async function handleKBSync(request, env) {
+  const auth = request.headers.get("x-admin-secret") || "";
+  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
+    return json({ ok: false, error: "unauthorized" }, 401);
+  return json(await syncKBFromNotion(env));
+}
+
 // ---- Skill sync: pull from the administrator's Notion registry into KV ----
 const REGISTRY_DB = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
 async function syncSkillsFromRegistry(env) {
@@ -568,6 +663,15 @@ export default {
       return handleTicket(request, env);
     }
 
+    if (path === "/api/kb/search") {
+      return handleKBSearch(request, env);
+    }
+
+    if (path === "/api/admin/sync-kb") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleKBSync(request, env);
+    }
+
     if (path === "/api/admin/sync-skills") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleSkillSync(request, env);
@@ -627,7 +731,8 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Hourly: pull fresh skills from the administrator's registry.
+    // Hourly: pull fresh skills and KB articles.
     ctx.waitUntil(syncSkillsFromRegistry(env));
+    ctx.waitUntil(syncKBFromNotion(env));
   },
 };
