@@ -1,6 +1,17 @@
 // Fleetly License API — serves skill instructions to licensed installs.
 // KV namespace "LICENSES" must be bound. Keys: "license:<KEY>" -> {"email","status","created"}
 
+const SKILL_ADDED = {
+  // added-date per trigger; skills added after a buyer's entitlement cutoff
+  // require an active membership. Update this when shipping a new skill.
+  "agent": "2026-10-08", "deactivate": "2026-10-08", "fleet": "2026-10-08",
+  "help": "2026-10-08", "load": "2026-10-08", "my-tasks": "2026-10-08",
+  "my-usage-resets": "2026-10-08", "note-is": "2026-10-08", "onboard": "2026-10-08",
+  "quota-board": "2026-10-08", "rebalance": "2026-10-08", "automatic": "2026-10-08",
+  "results-for-me": "2026-10-08", "save": "2026-10-08", "health-check": "2026-10-08",
+  "onboarding": "2026-10-08", "update-fleet": "2026-10-08",
+};
+
 const SKILLS = {
  "agent": "Dispatch a task. When Mike says 'Agent <name>: <prompt>' (e.g. 'Agent muse: draft the memo', 'Agent Grok Bot: summarize this'): create a row in the AI Task Queue with Task=<about five words from the prompt>, Status=Routed, Assigned AI=<named AI>, Assigned by=<your own name, or Mike if Mike said it>, Priority=Medium (High/Low if he says so), Prompt=<the prompt verbatim>; confirm in one line: 'Sent to <AI>.' Any fleet member can be named, including Grok Bot \u2014 upward delegation works exactly like downward delegation. When he says 'Agent: <prompt>' (no name): recommend the best agent yourself \u2014 strength match from the AI Fleet roster first, then quota headroom vs reset from the Usage Log, then least recently used; never invent quota figures (if stale or missing, decide on strength alone and say so) \u2014 then present your recommendation PLUS the other suitable AIs as tappable choices (only AIs suitable for this task: strength match and quota headroom, no unsuitable options); dispatch to Mike's pick and confirm 'Sent to <AI> \u2014 your pick.' or 'Sent to <AI> \u2014 my recommendation.' Efficiency: prefer free-tier AIs for suitable tasks; reserve Grok for what only it does well (real-time X/news, heavy research, Finance connector). If the request looks wasteful for the remaining quota (oversized job, re-run of settled work), say so briefly and suggest the cheaper path before dispatching.",
  "deactivate": "When Mike says 'deactivate: <AI>' (removing an AI from active fleet use): 1) Rename its AI Fleet roster row to '<AI> (inactive)' and record why in its notes. 2) From then on, exclude it from 'Agent:' suggestions, rebalance moves, the quota board, and the 'fleet:' active list. 3) Keep its task history and usage log rows intact \u2014 nothing is deleted. 4) Confirm in one line what was deactivated and why.",
@@ -122,7 +133,6 @@ async function handleStripeWebhook(request, env) {
     const name = (obj.customer_details && obj.customer_details.name) || "";
     const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
     const today = new Date().toISOString().split("T")[0];
-    const sixMonths = new Date(Date.now() + 182 * 86400 * 1000).toISOString().split("T")[0];
     // One key per buyer: look up any existing license by email first.
     let key = "";
     let record = null;
@@ -142,14 +152,12 @@ async function handleStripeWebhook(request, env) {
     if (obj.customer) record.stripe_customer = obj.customer;
     record.status = "active";
     if (mode === "subscription") {
-      // Membership: no expiry while subscribed.
+      // Membership: unlocks all skills while subscribed.
       record.plan = "membership";
-      record.expires = null;
     } else {
-      // Template: 6 months of updates from purchase.
+      // Template: new skills free for 6 months from purchase; core skills forever.
       record.plan = "template";
       record.purchased = today;
-      record.expires = sixMonths;
     }
     record.stripe_session = obj.id;
     if (env.LICENSES) {
@@ -179,13 +187,10 @@ async function handleStripeWebhook(request, env) {
         const rec = await env.LICENSES.get("license:" + key, "json");
         if (rec) {
           email = rec.email || "";
-          // Fall back to the template's 6-month window from original purchase.
-          // If that already passed, the key is effectively expired.
+          // Back to the template plan: core skills keep working, new skills
+          // gate on the original 6-month window from purchase.
           rec.plan = "template";
           rec.status = "active";
-          const purchased = rec.purchased || rec.created || "2026-10-09";
-          rec.expires = new Date(new Date(purchased).getTime() + 182 * 86400 * 1000)
-            .toISOString().split("T")[0];
           await env.LICENSES.put("license:" + key, JSON.stringify(rec));
         }
       }
@@ -254,13 +259,23 @@ export default {
       if (!lic || lic.status !== "active") {
         return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
       }
-      if (lic.expires && lic.expires < new Date().toISOString().split("T")[0]) {
-        return json({ ok: false, error: "expired",
-          message: "This Fleetly license's update period has ended. Add the Fleetly membership at https://fleetlybots.com/#pricing to keep going." }, 403);
+      // New-skill gate: the template includes every skill added in the first
+      // 6 months; skills added later need an active membership. Core skills
+      // never stop working — no brick.
+      const trigger = m[1];
+      const added = SKILL_ADDED[trigger] || "2026-10-08";
+      if (lic.plan !== "membership" && lic.status === "active") {
+        const purchased = lic.purchased || lic.created || "2026-10-09";
+        const cutoff = new Date(new Date(purchased).getTime() + 182 * 86400 * 1000)
+          .toISOString().split("T")[0];
+        if (added > cutoff) {
+          return json({ ok: false, error: "membership_required",
+            message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
+        }
       }
-      const skill = SKILLS[m[1]];
+      const skill = SKILLS[trigger];
       if (!skill) return json({ ok: false, error: "not_found" }, 404);
-      return json({ ok: true, trigger: m[1], instructions: skill });
+      return json({ ok: true, trigger: trigger, instructions: skill });
     }
 
     return json({ ok: false, error: "not_found" }, 404);
