@@ -147,19 +147,41 @@ async function handleStripeWebhook(request, env) {
   if (type === "customer.subscription.deleted") {
     // $6/mo cancelled: find the license by customer and deactivate it.
     const customer = obj.customer || "";
+    let key = "";
+    let email = "";
     if (env.LICENSES && customer) {
-      // We stored stripe_customer on the record; scan is not possible in KV,
-      // so we keep a customer->key index at issuance time (see below).
-      const key = await env.LICENSES.get("license-customer:" + customer);
+      key = await env.LICENSES.get("license-customer:" + customer);
       if (key) {
         const rec = await env.LICENSES.get("license:" + key, "json");
         if (rec) {
+          email = rec.email || "";
           rec.status = "cancelled";
           await env.LICENSES.put("license:" + key, JSON.stringify(rec));
         }
       }
     }
     if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+    // Confirm the cancellation by email so the buyer isn't left wondering.
+    if (email && env.RESEND_API_KEY) {
+      try {
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + env.RESEND_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            from: "Fleetly <hello@fleetlybots.com>",
+            to: [email],
+            subject: "Your Fleetly membership is cancelled",
+            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
+              + (key ? `<p>Your license key <strong>${key}</strong> has been deactivated.</p>` : "")
+              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
+              + `<p>— The Fleetly team</p>`,
+          }),
+        });
+      } catch (e) { /* cancellation stands even if the email fails */ }
+    }
     return json({ ok: true });
   }
 
