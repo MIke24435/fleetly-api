@@ -495,6 +495,18 @@ export default {
       return handleTicket(request, env);
     }
 
+    if (path === "/api/admin/deactivate" && request.method === "POST") {
+      // One-time use: deactivate the test license before launch.
+      const b = await request.json().catch(() => ({}));
+      if (b.key !== "FL-CY36A-U6S48") return json({ ok: false }, 400);
+      const rec = await env.LICENSES.get("license:" + b.key, "json");
+      if (rec) {
+        rec.status = "deactivated";
+        await env.LICENSES.put("license:" + b.key, JSON.stringify(rec));
+      }
+      return json({ ok: true, deactivated: !!rec });
+    }
+
     if (path === "/api/tickets/notify") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleTicketNotify(request, env);
