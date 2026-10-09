@@ -58,6 +58,14 @@ async function handleTicket(request, env) {
   const today = new Date().toISOString().split("T")[0];
   const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
 
+  // Sequential ticket number (FLT-0001, FLT-0002, ...).
+  let ticketNo = "";
+  if (env.LICENSES) {
+    const n = parseInt(await env.LICENSES.get("ticket-counter") || "0", 10) + 1;
+    await env.LICENSES.put("ticket-counter", String(n));
+    ticketNo = "FLT-" + String(n).padStart(4, "0");
+  }
+
   // Write the ticket into the administrator's Notion database.
   if (!env.NOTION_TOKEN) return json({ ok: false, error: "tickets_unavailable" }, 503);
   try {
@@ -72,6 +80,7 @@ async function handleTicket(request, env) {
         parent: { type: "data_source_id", data_source_id: TICKETS_DB },
         properties: {
           "Ticket": { title: [{ text: { content: title } }] },
+          "Ticket #": { rich_text: [{ text: { content: ticketNo } }] },
           "Status": { select: { name: "Inbox" } },
           "Buyer": { rich_text: [{ text: { content: (lic.email || "") + (lic.name ? " (" + lic.name + ")" : "") } }] },
           "License key": { rich_text: [{ text: { content: key } }] },
@@ -97,7 +106,7 @@ async function handleTicket(request, env) {
         body: JSON.stringify({
           from: "Fleetly <hello@fleetlybots.com>",
           to: ["fleetlybots@gmail.com"],
-          subject: "New Fleetly support ticket",
+          subject: "New Fleetly support ticket" + (ticketNo ? " (" + ticketNo + ")" : ""),
           html: "<p><strong>Buyer:</strong> " + (lic.email || key) + "</p>"
             + "<p><strong>Problem:</strong></p><p>" + problem.replace(/</g, "&lt;") + "</p>",
         }),
@@ -105,7 +114,7 @@ async function handleTicket(request, env) {
     } catch (e) { /* ticket is filed; the email is a courtesy */ }
   }
 
-  return json({ ok: true, filed: true });
+  return json({ ok: true, filed: true, ticket: ticketNo });
 }
 
 // ---- Stripe webhook: automatic license issuance ----
