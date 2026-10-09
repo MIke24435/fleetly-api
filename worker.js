@@ -54,6 +54,8 @@ async function handleTicket(request, env) {
     try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
   }
   if (!lic) return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+  if (lic.status === "refunded" || lic.status === "disputed")
+    return json({ ok: false, error: "license", message: "This license key was refunded. If you believe this is a mistake, reply to your receipt email." }, 403);
 
   const today = new Date().toISOString().split("T")[0];
   const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
@@ -343,6 +345,42 @@ async function handleStripeWebhook(request, env) {
         JSON.stringify({ email: email, reason: mail.reason }));
     }
     return json({ ok: true, issued: true, email_sent: mail.sent });
+  }
+
+  if (type === "charge.refunded") {
+    // $49 template refunded (or $6 charge refunded): revoke the license.
+    const pi = obj.payment_intent || "";
+    let key = "";
+    let record = null;
+    if (env.LICENSES && pi) {
+      // Find via the charge's receipt email.
+      const email = (obj.receipt_email || "").toLowerCase();
+      if (email) key = await env.LICENSES.get("license-email:" + email);
+      if (key) record = await env.LICENSES.get("license:" + key, "json");
+    }
+    if (record) {
+      record.status = "refunded";
+      await env.LICENSES.put("license:" + key, JSON.stringify(record));
+    }
+    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+    return json({ ok: true, revoked: !!record });
+  }
+
+  if (type === "charge.dispute.created") {
+    // Chargeback: treat like a refund — revoke the license.
+    const email = (obj.billing_details && obj.billing_details.email || "").toLowerCase();
+    let key = "";
+    let record = null;
+    if (env.LICENSES && email) {
+      key = await env.LICENSES.get("license-email:" + email);
+      if (key) record = await env.LICENSES.get("license:" + key, "json");
+    }
+    if (record) {
+      record.status = "disputed";
+      await env.LICENSES.put("license:" + key, JSON.stringify(record));
+    }
+    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
+    return json({ ok: true, revoked: !!record });
   }
 
   if (type === "customer.subscription.deleted") {
