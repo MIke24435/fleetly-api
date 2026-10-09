@@ -67,7 +67,7 @@ async function handleTicket(request, env) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        parent: { database_id: TICKETS_DB },
+        parent: { type: "data_source_id", data_source_id: TICKETS_DB },
         properties: {
           "Ticket": { title: [{ text: { content: title } }] },
           "Status": { select: { name: "Inbox" } },
