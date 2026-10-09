@@ -673,6 +673,24 @@ export default {
       const rec = { email: "test@fleetlybots.com", status: "active", plan: "template",
         purchased: "2026-10-09", created: "2026-10-09" };
       await env.LICENSES.put("license:FL-TEST01-TEST01", JSON.stringify(rec));
+      // Seed test KB articles
+      const articles = [
+        { id: "kb001", title: "How to cancel your membership", type: "How-to",
+          body: "To cancel: 1) Find your Stripe receipt email. 2) Click Manage subscription. 3) Click Cancel. Access stays active through the billing period. Your key keeps working.",
+          keywords: "cancel cancellation membership subscription stop billing" },
+        { id: "kb002", title: "Where to paste your license key", type: "How-to",
+          body: "Open the Settings database and paste your key (FL-XXXXX-XXXXX) into the License key field. Your AI cannot fetch skills until the key is in place.",
+          keywords: "license key setup install getting started paste key" },
+        { id: "kb003", title: "Template vs membership: what you keep", type: "Plan comparison",
+          body: "The $49 template is yours forever, including core skills and refinements. New skills in your first 6 months are free. After that, new skills need the $6/month membership.",
+          keywords: "pricing plans membership template what do i keep ownership" },
+      ];
+      const index = [];
+      for (const a of articles) {
+        await env.LICENSES.put("kb:" + a.id, JSON.stringify(a));
+        index.push({ id: a.id, title: a.title, keywords: a.keywords + " " + a.title.toLowerCase() });
+      }
+      await env.LICENSES.put("kb:index", JSON.stringify(index));
       return json({ ok: true });
     }
 
