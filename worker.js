@@ -379,7 +379,7 @@ async function handleStripeWebhook(request, env) {
             to: [email],
             subject: "Your Fleetly membership is cancelled",
             html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
-              + (key ? `<p>Your license key <strong>${key}</strong> has been deactivated.</p>` : "")
+              + (key ? `<p>Your license key <strong>${key}</strong> still works: your template and core skills keep working, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
               + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
               + `<p>— The Fleetly team</p>`,
           }),
