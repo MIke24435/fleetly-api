@@ -249,9 +249,17 @@ async function syncSkillsFromRegistry(env) {
       if (!trigger || !instructions || instructions.length < 20) continue;
       if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
       // De-Mike: buyer-facing text uses "the user", never "Mike".
+      // De-Mike: buyer-facing text uses "the user", never "Mike".
       const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
       const version = text("Version").trim();
       const updated = text("Updated").trim();
+      // Archive the outgoing version before overwriting (rollback history).
+      const prev = await env.LICENSES.get("skill:" + trigger);
+      const prevVer = await env.LICENSES.get("skill-version:" + trigger);
+      if (prev && prev !== clean) {
+        const stamp = new Date().toISOString().split("T")[0];
+        await env.LICENSES.put("skill-history:" + trigger + ":" + stamp + ":" + (prevVer || "unversioned"), prev);
+      }
       await env.LICENSES.put("skill:" + trigger, clean);
       if (version) await env.LICENSES.put("skill-version:" + trigger, version);
       if (updated) await env.LICENSES.put("skill-updated:" + trigger, updated);
