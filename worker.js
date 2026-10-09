@@ -80,7 +80,7 @@ async function handleTicket(request, env) {
         parent: { type: "data_source_id", data_source_id: TICKETS_DB },
         properties: {
           "Ticket": { title: [{ text: { content: title } }] },
-          "Ticket #": { rich_text: [{ text: { content: ticketNo } }] },
+          "Ticket No": { rich_text: [{ text: { content: ticketNo } }] },
           "Status": { select: { name: "Inbox" } },
           "Buyer": { rich_text: [{ text: { content: (lic.email || "") + (lic.name ? " (" + lic.name + ")" : "") } }] },
           "License key": { rich_text: [{ text: { content: key } }] },
