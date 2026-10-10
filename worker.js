@@ -264,6 +264,24 @@ async function handleWaitlist(request, env) {
     const errText = await r.text().catch(() => "");
     return json({ ok: false, error: "notion_write_failed", detail: errText.slice(0, 200) }, 500);
   }
+  // Notify the administrator by email.
+  if (env.RESEND_API_KEY) {
+    try {
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + env.RESEND_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: "Fleetly <hello@fleetlybots.com>",
+          to: ["fleetlybots@gmail.com"],
+          subject: "New waitlist signup: " + (name || email),
+          html: "<p><strong>" + (name || "(no name)") + "</strong> just joined the waitlist.</p><p>Email: " + email + "</p>" + (b.x_handle ? "<p>X: " + b.x_handle + "</p>" : ""),
+        }),
+      });
+    } catch (e) {}
+  }
   return json({ ok: true, added: true });
 }
 
