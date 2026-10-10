@@ -207,6 +207,66 @@ async function handleTicketNotify(request, env) {
   return json({ ok: true, notified: buyerEmail, ticket: ticketNo });
 }
 
+// ---- Waitlist: form signup -> Beta Testers database ----
+const BETA_TESTERS_DS = "31671ff6-96d4-4345-bd59-f9478b3d9233";
+const BETA_TESTERS_PAGE = "d0a3c5dba2074278a021f94139b60cc8";
+async function handleWaitlist(request, env) {
+  if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const name = (b.name || "").trim();
+  const email = (b.email || "").trim();
+  if (!email) return json({ ok: false, error: "email_required" }, 400);
+  if (!env.NOTION_TOKEN) return json({ ok: false, error: "not_configured" }, 500);
+
+  // Dedupe: skip if this email already exists.
+  try {
+    const q = await fetch("https://api.notion.com/v1/databases/" + BETA_TESTERS_PAGE + "/query", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.NOTION_TOKEN,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        filter: { property: "Email", email: { equals: email } },
+        page_size: 1,
+      }),
+    });
+    const jq = await q.json();
+    if (jq.results && jq.results.length > 0)
+      return json({ ok: true, duplicate: true });
+  } catch (e) {}
+
+  const props = {
+    "Name": { title: [{ text: { content: name || email } }] },
+    "Email": { email: email },
+    "Status": { select: { name: "Spotted" } },
+    "Source": { select: { name: "Waitlist form" } },
+    "Date found": { date: { start: new Date().toISOString().split("T")[0] } },
+  };
+  if (b.notes) props["Notes"] = { rich_text: [{ text: { content: String(b.notes).slice(0, 1000) } }] };
+  if (b.x_handle) props["X handle"] = { rich_text: [{ text: { content: String(b.x_handle).slice(0, 100) } }] };
+
+  const r = await fetch("https://api.notion.com/v1/pages", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + env.NOTION_TOKEN,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: BETA_TESTERS_DS },
+      properties: props,
+    }),
+  });
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    return json({ ok: false, error: "notion_write_failed", detail: errText.slice(0, 200) }, 500);
+  }
+  return json({ ok: true, added: true });
+}
+
 // ---- KB search: query published knowledge base articles ----
 const CONTENT_DB = "00942471-34fa-49fe-af64-ea9356313b7f";
 const CONTENT_PAGE = "9ac7f508a8144300b7a967946fd7b41f";
@@ -661,6 +721,10 @@ export default {
     if (path === "/api/tickets") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleTicket(request, env);
+    }
+
+    if (path === "/api/waitlist") {
+      return handleWaitlist(request, env);
     }
 
     if (path === "/api/kb/search") {
