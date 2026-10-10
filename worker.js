@@ -754,6 +754,28 @@ export default {
       return handleKBSync(request, env);
     }
 
+    if (path === "/api/admin/create-key") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      const auth = request.headers.get("x-admin-secret") || "";
+      if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
+        return json({ ok: false, error: "unauthorized" }, 401);
+      let b;
+      try { b = await request.json(); } catch (e) { b = {}; }
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      const seg = () => Array.from({length: 5}, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+      const key = "FL-" + seg() + "-" + seg();
+      const rec = {
+        email: (b.email || "manual@fleetlybots.com"),
+        status: "active",
+        plan: b.plan || "template",
+        purchased: new Date().toISOString().split("T")[0],
+        created: new Date().toISOString(),
+        note: "manual",
+      };
+      await env.LICENSES.put("license:" + key, JSON.stringify(rec));
+      return json({ ok: true, key: key });
+    }
+
     if (path === "/api/admin/sync-skills") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleSkillSync(request, env);
