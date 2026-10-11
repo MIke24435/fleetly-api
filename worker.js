@@ -349,15 +349,18 @@ async function handleKBSearch(request, env) {
     const idxRaw = await env.LICENSES.get("kb:index");
     if (idxRaw) index = JSON.parse(idxRaw);
   } catch (e) {}
-  const terms = query.split(/\s+/).filter(w => w.length > 2);
+  const STOPWORDS = new Set(["what","when","where","which","who","whom","whose","how","why","is","are","was","were","be","been","being","do","does","did","doing","a","an","the","and","or","but","of","at","by","for","with","about","into","through","during","before","after","above","below","to","from","up","down","in","out","on","off","over","under","again","further","then","once","here","there","all","any","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","so","than","too","very","can","will","just","should","now","it","its","this","that","these","those","i","me","my","we","you","your","he","she","they","them","his","her","their"]);
+  const terms = query.split(/\s+/).filter(w => w.length > 2 && !STOPWORDS.has(w));
+  if (terms.length === 0) return json({ ok: true, query: query, results: [] });
   const scored = [];
   for (const entry of index) {
     let score = 0;
+    let hits = 0;
     for (const term of terms) {
-      if (entry.keywords.includes(term)) score += 2;
-      if (entry.title.toLowerCase().includes(term)) score += 3;
+      if (entry.keywords.includes(term)) { score += 2; hits++; }
+      if (entry.title.toLowerCase().includes(term)) { score += 3; hits++; }
     }
-    if (score > 0) scored.push({ entry: entry, score: score });
+    if (hits >= 2 || score >= 5) scored.push({ entry: entry, score: score });
   }
   scored.sort((a, b) => b.score - a.score);
   const results = [];
