@@ -36,7 +36,7 @@ const SKILLS = {
  "clean": "When the user says 'clean:' (done playing with the sample data): 1) In each Fleetly database (Task Queue, AI Fleet, Work Log), find rows where the Sample checkbox is checked. 2) Delete those rows. 3) Confirm in one line: 'Sample data cleared \u2014 your databases are empty and ready.' Never delete rows that are not marked as samples. If there are no sample rows, say 'Already clean \u2014 nothing to remove.'",
 };
 
-const LICENSE_MSG = "This Fleetly install needs a valid license key. Your key goes in the 'Fleetly license key' field on your Fleetly home page in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
+const LICENSE_MSG = "This Fleetly install needs a valid license key. Paste your key in the Settings database \u2192 License key field in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
 
 // ---- Support tickets: buyer files a ticket, row lands in the
 // administrator's Notion "Support Tickets" database ----
