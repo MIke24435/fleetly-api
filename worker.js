@@ -320,7 +320,7 @@ async function syncKBFromNotion(env) {
     const keywords = text("Keywords").trim().toLowerCase();
     const type = (props.Type && props.Type.select && props.Type.select.name) || "";
     if (!title || !body) continue;
-    const id = page.id.replace(/-/g, "").slice(0, 8);
+    const id = page.id.replace(/-/g, "");
     const article = { id: id, title: title, type: type, body: body, keywords: keywords };
     await env.LICENSES.put("kb:" + id, JSON.stringify(article));
     index.push({ id: id, title: title, keywords: keywords + " " + title.toLowerCase() });
