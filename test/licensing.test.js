@@ -153,6 +153,7 @@ describe("licensing hardening", { concurrency: false }, () => {
     const kv = memoryKv();
     const key = "FL-LIVEK-EY11";
     await kv.put("license:" + key, JSON.stringify(activeRecord()));
+    await kv.put("skill-added:my-tasks", "2026-10-01");
     const env = testEnv(kv);
     assert.equal((await skills(env, key)).status, 200);
     assert.equal((await kb(env, key)).status, 200);
@@ -453,6 +454,7 @@ describe("licensing hardening", { concurrency: false }, () => {
     const kv = memoryKv();
     await kv.put("license:FL-LIVE0-LIVE", JSON.stringify(activeRecord({ email: "buyer@example.com" })));
     await kv.put("license-email:buyer@example.com", "FL-LIVE0-LIVE");
+    await kv.put("skill-added:my-tasks", "2026-10-01");
     const env = testEnv(kv, { fetch: async () => new Response("{}", { status: 200 }) });
     const testEvent = checkoutEvent({
       event: { id: "evt_test_1", livemode: false },

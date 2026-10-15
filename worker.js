@@ -17,18 +17,21 @@ import {
   timedEqual,
 } from "./licensing.js";
 
-const SKILL_ADDED = {
-  // added-date per trigger; skills added after a buyer's entitlement cutoff
-  // require an active membership. Update this when shipping a new skill.
-  "agent": "2026-10-08", "deactivate": "2026-10-08", "fleet": "2026-10-08",
-  "help": "2026-10-08", "load": "2026-10-08", "my-tasks": "2026-10-08",
-  "my-usage-resets": "2026-10-08", "note-is": "2026-10-08", "onboard": "2026-10-08",
-  "quota-board": "2026-10-08", "rebalance": "2026-10-08", "automatic": "2026-10-08",
-  "results-for-me": "2026-10-08", "save": "2026-10-08", "health-check": "2026-10-08",
-  "onboarding": "2026-10-08", "update-fleet": "2026-10-08",
-  "support": "2026-10-08",
-  "clean": "2026-10-08",
-};
+import {
+  MEMBERSHIP_REQUIRED_NOTE,
+  UPDATES_FROM,
+  UPDATE_BEGIN,
+  diffForLicense,
+  formatUpdateId,
+  isMembershipGated,
+  contentVersion,
+  kbFromContentPage,
+  makeUnsubToken,
+  nextVersionMap,
+  renderUpdateEmail,
+  skillFromRegistryPage,
+  validEmail,
+} from "./updates.js";
 
 const SKILLS = {
  "agent": "Dispatch a task. When Mike says 'Agent <name>: <prompt>' (e.g. 'Agent muse: draft the memo', 'Agent Grok Bot: summarize this'): create a row in the AI Task Queue with Task=<about five words from the prompt>, Status=Routed, Assigned AI=<named AI>, Assigned by=<your own name, or Mike if Mike said it>, Priority=Medium (High/Low if he says so), Prompt=<the prompt verbatim>; confirm in one line: 'Sent to <AI>.' Any fleet member can be named, including Grok Bot \u2014 upward delegation works exactly like downward delegation. When he says 'Agent: <prompt>' (no name): recommend the best agent yourself \u2014 strength match from the AI Fleet roster first, then quota headroom vs reset from the Usage Log, then least recently used; never invent quota figures (if stale or missing, decide on strength alone and say so) \u2014 then present your recommendation PLUS the other suitable AIs as tappable choices (only AIs suitable for this task: strength match and quota headroom, no unsuitable options); dispatch to Mike's pick and confirm 'Sent to <AI> \u2014 your pick.' or 'Sent to <AI> \u2014 my recommendation.' Efficiency: prefer free-tier AIs for suitable tasks; reserve Grok for what only it does well (real-time X/news, heavy research, Finance connector). If the request looks wasteful for the remaining quota (oversized job, re-run of settled work), say so briefly and suggest the cheaper path before dispatching.",
@@ -357,45 +360,37 @@ const CONTENT_DB = "00942471-34fa-49fe-af64-ea9356313b7f";
 const CONTENT_PAGE = "9ac7f508a8144300b7a967946fd7b41f";
 async function syncKBFromNotion(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
-  const r = await fetch("https://api.notion.com/v1/databases/" + CONTENT_PAGE + "/query", {
-    method: "POST",
-    headers: {
-      "Authorization": "Bearer " + env.NOTION_TOKEN,
-      "Notion-Version": "2022-06-28",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      filter: { property: "Status", select: { equals: "Published" } },
-      page_size: 100,
-    }),
-  });
-  if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
-  const j = await r.json();
+  // No server-side Status filter: the operator KB uses Status = Published,
+  // and the template Knowledge Base uses a Draft checkbox. Both are applied
+  // per row so a Draft-only database still syncs.
+  const fetched = await queryAllDatabase(env, CONTENT_PAGE);
+  if (!fetched.ok) return fetched;
+  const prevCatalog = parseJson(await env.LICENSES.get("kb-catalog"), []);
   let synced = 0;
   const index = [];
-  for (const page of (j.results || [])) {
-    const props = page.properties || {};
-    const text = (p) => {
-      const v = props[p];
-      if (!v) return "";
-      if (v.title) return v.title.map(x => x.plain_text).join("");
-      if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
-      return "";
+  const seen = [];
+  for (const page of fetched.pages) {
+    const article = kbFromContentPage(page);
+    if (article.skip) continue;
+    const stored = {
+      id: article.id, title: article.title, type: article.type,
+      body: article.body, keywords: article.keywords, version: article.version,
     };
-    const title = text("Title").trim();
-    const body = text("Body").trim();
-    const keywords = text("Keywords").trim().toLowerCase();
-    const type = (props.Type && props.Type.select && props.Type.select.name) || "";
-    if (!title || !body) continue;
-    const id = page.id.replace(/-/g, "").slice(0, 8);
-    const article = { id: id, title: title, type: type, body: body, keywords: keywords };
-    await env.LICENSES.put("kb:" + id, JSON.stringify(article));
-    index.push({ id: id, title: title, keywords: keywords + " " + title.toLowerCase() });
+    await env.LICENSES.put("kb:" + article.id, JSON.stringify(stored));
+    index.push({
+      id: article.id,
+      title: article.title,
+      keywords: article.keywords + " " + article.title.toLowerCase(),
+    });
+    if (!seen.includes(article.id)) seen.push(article.id);
     synced++;
   }
+  const deprecated = prevCatalog.filter(id => !seen.includes(id));
   await env.LICENSES.put("kb:index", JSON.stringify(index));
+  await env.LICENSES.put("kb-catalog", JSON.stringify(seen));
+  await env.LICENSES.put("kb-deprecated", JSON.stringify(deprecated));
   await env.LICENSES.put("kb-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced };
+  return { ok: true, synced: synced, deprecated: deprecated.length };
 }
 
 async function handleKBSearch(request, env) {
@@ -451,15 +446,20 @@ async function handleKBSync(request, env) {
 }
 
 // ---- Skill sync: pull from the administrator's Notion registry into KV ----
-const REGISTRY_DB = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
-async function syncSkillsFromRegistry(env) {
-  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+// The hourly sync has always queried REGISTRY_QUERY_DB. REGISTRY_DB_MISMATCH
+// was declared beside it and never passed to Notion. They are not the same
+// database. The query stays on the id production already uses.
+const REGISTRY_QUERY_DB = "4de82984-9fc8-4ee5-b269-4d5d22398504";
+const REGISTRY_DB_MISMATCH = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
+
+async function queryAllDatabase(env, databaseId) {
+  const pages = [];
   let cursor = null;
-  let synced = 0;
+  const doFetch = http(env);
   do {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
-    const r = await fetch("https://api.notion.com/v1/databases/4de82984-9fc8-4ee5-b269-4d5d22398504/query", {
+    const r = await doFetch("https://api.notion.com/v1/databases/" + databaseId + "/query", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.NOTION_TOKEN,
@@ -470,48 +470,58 @@ async function syncSkillsFromRegistry(env) {
     });
     if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
     const j = await r.json();
-    for (const page of (j.results || [])) {
-      const props = page.properties || {};
-      const text = (p) => {
-        const v = props[p];
-        if (!v) return "";
-        if (v.title) return v.title.map(x => x.plain_text).join("");
-        if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
-        return "";
-      };
-      const skill = text("Skill").trim();
-      let trigger = text("Trigger").trim().replace(/:$/, "").replace(/\s+/g, "-").toLowerCase();
-      const instructions = text("Instructions").trim();
-      const appliesTo = text("Applies to").trim().toLowerCase();
-      // Draft checkbox (or Draft in the name) means not ready — skip it.
-      const draftProp = props["Draft"];
-      const isDraft = (draftProp && draftProp.checkbox === true)
-        || /\bdraft\b/i.test(skill);
-      if (isDraft) continue;
-      // Only sync user-facing skills with real instructions.
-      if (!trigger || !instructions || instructions.length < 20) continue;
-      if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
-      // De-Mike: buyer-facing text uses "the user", never "Mike".
-      // De-Mike: buyer-facing text uses "the user", never "Mike".
-      const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
-      const version = text("Version").trim();
-      const updated = text("Updated").trim();
-      // Archive the outgoing version before overwriting (rollback history).
-      const prev = await env.LICENSES.get("skill:" + trigger);
-      const prevVer = await env.LICENSES.get("skill-version:" + trigger);
-      if (prev && prev !== clean) {
-        const stamp = new Date().toISOString().split("T")[0];
-        await env.LICENSES.put("skill-history:" + trigger + ":" + stamp + ":" + (prevVer || "unversioned"), prev);
-      }
-      await env.LICENSES.put("skill:" + trigger, clean);
-      if (version) await env.LICENSES.put("skill-version:" + trigger, version);
-      if (updated) await env.LICENSES.put("skill-updated:" + trigger, updated);
-      synced++;
-    }
+    for (const page of (j.results || [])) pages.push(page);
     cursor = j.has_more ? j.next_cursor : null;
   } while (cursor);
+  return { ok: true, pages: pages };
+}
+
+async function syncSkillsFromRegistry(env) {
+  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+  const fetched = await queryAllDatabase(env, REGISTRY_QUERY_DB);
+  if (!fetched.ok) return fetched;
+  const prevIndex = parseJson(await env.LICENSES.get("skill-index"), []);
+  const seen = [];
+  let synced = 0;
+  for (const page of fetched.pages) {
+    const row = skillFromRegistryPage(page.properties || {});
+    if (row.skip) continue;
+    const prev = await env.LICENSES.get("skill:" + row.slug);
+    const prevVer = await env.LICENSES.get("skill-version:" + row.slug);
+    if (prev && prev !== row.text) {
+      const stamp = new Date().toISOString().split("T")[0];
+      await env.LICENSES.put(
+        "skill-history:" + row.slug + ":" + stamp + ":" + (prevVer || "unversioned"),
+        prev);
+    }
+    await env.LICENSES.put("skill:" + row.slug, row.text);
+    if (row.explicitVersion) await env.LICENSES.put("skill-version:" + row.slug, row.explicitVersion);
+    if (row.updated) await env.LICENSES.put("skill-updated:" + row.slug, row.updated);
+    // Empty string when the registry row has no Added date. The gate treats
+    // that as new. Missing key (never synced) is the same fail-safe.
+    await env.LICENSES.put("skill-added:" + row.slug, row.added || "");
+    await env.LICENSES.put("skill-record:" + row.slug, JSON.stringify({
+      slug: row.slug,
+      match: row.match,
+      version: row.version,
+      added: row.added || "",
+      text: row.text,
+      deprecated: false,
+    }));
+    if (!seen.includes(row.slug)) seen.push(row.slug);
+    synced++;
+  }
+  const deprecated = prevIndex.filter(slug => !seen.includes(slug));
+  for (const slug of deprecated) {
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec) continue;
+    rec.deprecated = true;
+    await env.LICENSES.put("skill-record:" + slug, JSON.stringify(rec));
+  }
+  await env.LICENSES.put("skill-index", JSON.stringify(seen));
+  await env.LICENSES.put("skill-deprecated", JSON.stringify(deprecated));
   await env.LICENSES.put("skill-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced };
+  return { ok: true, synced: synced, deprecated: deprecated.length };
 }
 
 async function handleSkillSync(request, env) {
@@ -997,6 +1007,335 @@ async function handleRotate(request, env) {
     test: testMode,
   });
 }
+
+// ---- OTA skill/KB update emails ----
+// Buyers register a Coordinator inbox. An admin run (dry-run by default)
+// emails that inbox the rows that changed since the license's last send.
+// The hourly sync does not send mail.
+
+function updatesFrom(env) {
+  return (env && env.UPDATES_FROM) || UPDATES_FROM;
+}
+
+function updatesBase(env) {
+  return ((env && env.UPDATES_PUBLIC_BASE) || "https://api.fleetlybots.com").replace(/\/$/, "");
+}
+
+// Broadcast walks live licenses only. A test key is included when the
+// admin names it, and loadLicense keeps that record in the test namespace.
+async function listLicenseKeys(env) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.LICENSES.list({ prefix: "license:", cursor: cursor, limit: 1000 });
+    for (const entry of (page.keys || [])) {
+      const name = entry.name.startsWith("license:") ? entry.name.slice("license:".length) : "";
+      if (name) keys.push(name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return keys;
+}
+
+async function loadUpdateCatalog(env) {
+  const items = [];
+  const skillIndex = parseJson(await env.LICENSES.get("skill-index"), []);
+  const skillDeprecated = parseJson(await env.LICENSES.get("skill-deprecated"), []);
+  for (const slug of skillIndex) {
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec || rec.deprecated) continue;
+    items.push({
+      storageKey: "skill:" + slug,
+      type: "skill",
+      match: rec.match,
+      version: rec.version || contentVersion("", rec.text),
+      added: rec.added || "",
+      text: rec.text,
+      deprecated: false,
+    });
+  }
+  for (const slug of skillDeprecated) {
+    if (skillIndex.includes(slug)) continue;
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec) continue;
+    items.push({
+      storageKey: "skill:" + slug,
+      type: "skill",
+      match: rec.match,
+      version: rec.version || contentVersion("", rec.text),
+      added: rec.added || "",
+      text: rec.text,
+      deprecated: true,
+    });
+  }
+  const kbCatalog = parseJson(await env.LICENSES.get("kb-catalog"), []);
+  const kbDeprecated = parseJson(await env.LICENSES.get("kb-deprecated"), []);
+  for (const id of kbCatalog) {
+    const article = parseJson(await env.LICENSES.get("kb:" + id), null);
+    if (!article) continue;
+    items.push({
+      storageKey: "kb:" + id,
+      type: "kb",
+      match: article.title,
+      version: article.version || contentVersion("", article.body),
+      added: "",
+      text: article.body,
+      deprecated: false,
+    });
+  }
+  for (const id of kbDeprecated) {
+    if (kbCatalog.includes(id)) continue;
+    const article = parseJson(await env.LICENSES.get("kb:" + id), null);
+    if (!article) continue;
+    items.push({
+      storageKey: "kb:" + id,
+      type: "kb",
+      match: article.title,
+      version: article.version || contentVersion("", article.body),
+      added: "",
+      text: article.body,
+      deprecated: true,
+    });
+  }
+  return items;
+}
+
+async function peekUpdateId(env, date) {
+  const ymd = date.replace(/-/g, "");
+  const n = parseInt(await env.LICENSES.get("updates-seq:" + ymd) || "0", 10) + 1;
+  return formatUpdateId(date, n);
+}
+
+async function reserveUpdateId(env, date) {
+  const ymd = date.replace(/-/g, "");
+  const n = parseInt(await env.LICENSES.get("updates-seq:" + ymd) || "0", 10) + 1;
+  await env.LICENSES.put("updates-seq:" + ymd, String(n));
+  return formatUpdateId(date, n);
+}
+
+async function ensureUnsubToken(env, key, lic, testMode) {
+  if (lic.updates_unsub_token) return lic.updates_unsub_token;
+  const token = makeUnsubToken();
+  lic.updates_unsub_token = token;
+  const prefix = nsPrefix(!!testMode);
+  await env.LICENSES.put(prefix + "license:" + key, JSON.stringify(lic));
+  await env.LICENSES.put(prefix + "updates-unsub:" + token, key);
+  return token;
+}
+
+async function sendUpdateEmail(env, to, rendered, unsubscribeUrl) {
+  const doFetch = http(env);
+  const payload = {
+    from: updatesFrom(env),
+    to: [to],
+    subject: rendered.subject,
+    text: rendered.text,
+    html: rendered.html,
+  };
+  if (unsubscribeUrl) {
+    payload.headers = { "List-Unsubscribe": "<" + unsubscribeUrl + ">" };
+  }
+  const r = await doFetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + env.RESEND_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return { sent: r.ok, status: r.status };
+}
+
+async function handleCoordinator(request, env) {
+  if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const key = (body.key || "").trim();
+  const email = (body.email || "").trim();
+  if (!key || !email) return json({ ok: false, error: "key_and_email_required" }, 400);
+  if (!validEmail(email)) return json({ ok: false, error: "bad_email" }, 400);
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
+  const lic = gate.record;
+  lic.coordinator_email = email;
+  await ensureUnsubToken(env, key, lic, gate.test);
+  await env.LICENSES.put(gate.storageKey, JSON.stringify(lic));
+  const resp = { ok: true };
+  if (gate.test) resp.test = true;
+  return json(resp);
+}
+
+async function handleUnsubscribe(request, env) {
+  if (request.method !== "GET" && request.method !== "POST") {
+    return json({ ok: false, error: "method" }, 405);
+  }
+  const url = new URL(request.url);
+  let token = (url.searchParams.get("token") || "").trim();
+  if (!token && request.method === "POST") {
+    try {
+      const body = await request.json();
+      token = (body.token || "").trim();
+    } catch (e) { token = ""; }
+  }
+  if (!token) return json({ ok: false, error: "token_required" }, 400);
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let key = await env.LICENSES.get("updates-unsub:" + token);
+  let testMode = false;
+  if (!key) {
+    key = await env.LICENSES.get("test:updates-unsub:" + token);
+    testMode = !!key;
+  }
+  if (!key) return json({ ok: false, error: "not_found" }, 404);
+  const storageKey = licenseStorageKey(key, testMode);
+  const lic = await env.LICENSES.get(storageKey, "json");
+  if (!lic) return json({ ok: false, error: "not_found" }, 404);
+  lic.updates_opt_out = true;
+  await env.LICENSES.put(storageKey, JSON.stringify(lic));
+  if (request.method === "GET") {
+    return new Response(
+      "<!doctype html><meta charset=\"utf-8\"><title>Fleetly updates</title>"
+      + "<p>Fleetly update emails are turned off for this license. You can keep using Fleetly.</p>",
+      { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+  return json({ ok: true, updates_opt_out: true });
+}
+
+async function runUpdates(env, options) {
+  const dryRun = options.dryRun !== false;
+  const date = options.date || new Date().toISOString().slice(0, 10);
+  const catalog = await loadUpdateCatalog(env);
+  const keys = options.onlyKey ? [options.onlyKey] : await listLicenseKeys(env);
+  const pending = [];
+  const skipped = [];
+
+  for (const key of keys) {
+    const ending = licenseEnding(key);
+    const found = await loadLicense(env, key);
+    if (!isActiveLicense(found && found.record)) {
+      skipped.push({ license_ending: ending, reason: "inactive" });
+      continue;
+    }
+    const lic = found.record;
+    if (lic.updates_opt_out) {
+      skipped.push({ license_ending: ending, reason: "opt_out" });
+      continue;
+    }
+    const to = (lic.coordinator_email || "").trim();
+    if (!to) {
+      skipped.push({ license_ending: ending, reason: "no_coordinator" });
+      continue;
+    }
+    const sentKey = nsPrefix(found.test) + "updates-sent:" + key;
+    const sent = parseJson(await env.LICENSES.get(sentKey), {});
+    const items = diffForLicense(catalog, sent.versions || {}, lic);
+    if (items.length === 0) {
+      skipped.push({ license_ending: ending, reason: "no_changes" });
+      continue;
+    }
+    pending.push({ key: key, lic: lic, to: to, sent: sent, items: items, test: found.test, sentKey: sentKey });
+  }
+
+  if (!dryRun && pending.length && !env.RESEND_API_KEY) {
+    return { ok: false, error: "not_configured", dry_run: false, status: 503 };
+  }
+
+  let updateId = null;
+  if (pending.length) {
+    updateId = dryRun ? await peekUpdateId(env, date) : await reserveUpdateId(env, date);
+  }
+
+  const emails = [];
+  for (const row of pending) {
+    const ending = licenseEnding(row.key);
+    let token = row.lic.updates_unsub_token || "";
+    if (!token && !dryRun) token = await ensureUnsubToken(env, row.key, row.lic, row.test);
+    const unsubscribeUrl = token
+      ? updatesBase(env) + "/api/updates/unsubscribe?token=" + encodeURIComponent(token)
+      : "";
+    let rendered;
+    try {
+      rendered = renderUpdateEmail({
+        updateId: updateId,
+        date: date,
+        licenseKey: row.key,
+        plan: row.lic.plan,
+        items: row.items,
+        unsubscribeUrl: unsubscribeUrl,
+      });
+    } catch (e) {
+      skipped.push({ license_ending: ending, reason: "render_blocked" });
+      continue;
+    }
+    const preview = {
+      to: row.to,
+      subject: rendered.subject,
+      text: rendered.text,
+      html: rendered.html,
+      license_ending: rendered.license_ending,
+      changes: row.items.length,
+      membership_required: row.items.filter(item => item.membership_required).length,
+    };
+    if (dryRun) {
+      preview.dry_run = true;
+      emails.push(preview);
+      continue;
+    }
+    let result;
+    try {
+      result = await sendUpdateEmail(env, row.to, rendered, unsubscribeUrl);
+    } catch (e) {
+      skipped.push({ license_ending: ending, reason: "send_failed" });
+      continue;
+    }
+    if (!result.sent) {
+      skipped.push({ license_ending: ending, reason: "send_failed", status: result.status });
+      continue;
+    }
+    await env.LICENSES.put(row.sentKey, JSON.stringify({
+      update_id: updateId,
+      sent_at: new Date().toISOString(),
+      versions: nextVersionMap(row.sent.versions || {}, row.items),
+    }));
+    preview.dry_run = false;
+    preview.sent = true;
+    emails.push(preview);
+  }
+
+  return {
+    ok: true,
+    dry_run: dryRun,
+    update_id: updateId,
+    date: date,
+    sent: emails.filter(email => email.sent).length,
+    emails: emails,
+    skipped: skipped,
+    catalog_empty: catalog.length === 0,
+  };
+}
+
+async function handleSendUpdates(request, env) {
+  if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body = {};
+  if (request.headers.get("content-length") !== "0") {
+    try { body = await request.json(); } catch (e) { body = {}; }
+  }
+  if (!body || typeof body !== "object") body = {};
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(body.date || "") ? body.date : "";
+  const result = await runUpdates(env, {
+    dryRun: body.dry_run !== false,
+    date: date || undefined,
+    onlyKey: (body.key || "").trim() || undefined,
+  });
+  const status = result.status || (result.ok ? 200 : 503);
+  const payload = Object.assign({}, result);
+  delete payload.status;
+  return json(payload, status);
+}
+
 function json(data, status) {
   return new Response(JSON.stringify(data), {
     status: status || 200,
@@ -1061,6 +1400,18 @@ export default {
       return handleSkillSync(request, env);
     }
 
+    if (path === "/api/coordinator") {
+      return handleCoordinator(request, env);
+    }
+
+    if (path === "/api/updates/unsubscribe") {
+      return handleUnsubscribe(request, env);
+    }
+
+    if (path === "/api/admin/send-updates") {
+      return handleSendUpdates(request, env);
+    }
+
     if (path === "/api/tickets/notify") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleTicketNotify(request, env);
@@ -1077,19 +1428,25 @@ export default {
       const gate = await requireActiveLicense(env, key);
       if (!gate.ok) return gate.response;
       const lic = gate.record;
-      // New-skill gate: the template includes every skill added in the first
-      // 6 months; skills added later need an active membership. Core skills
-      // never stop working — no brick.
+      // New-skill gate: skills added after purchase + 182 days need an
+      // active membership. The Added date comes from the operator registry.
+      // A skill with no Added date is treated as new (gated), not old.
       const trigger = m[1];
-      const added = SKILL_ADDED[trigger] || "2026-10-08";
-      if (lic.plan !== "membership" && lic.status === "active") {
-        const purchased = lic.purchased || lic.created || "2026-10-09";
-        const cutoff = new Date(new Date(purchased).getTime() + 182 * 86400 * 1000)
-          .toISOString().split("T")[0];
-        if (added > cutoff) {
-          return json({ ok: false, error: "membership_required",
-            message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
-        }
+      let added = "";
+      if (env.LICENSES) {
+        try { added = (await env.LICENSES.get("skill-added:" + trigger)) || ""; } catch (e) { added = ""; }
+      }
+      if (isMembershipGated({
+        type: "skill",
+        action: "add",
+        added: added,
+        plan: lic.plan,
+        previouslyDelivered: false,
+        purchased: lic.purchased,
+        created: lic.created,
+      })) {
+        return json({ ok: false, error: "membership_required",
+          message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
       }
       // KV-synced skills take priority; hardcoded SKILLS is the fallback.
       let skill = null;
@@ -1112,8 +1469,11 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Hourly: pull fresh skills and KB articles.
+    // Hourly: pull fresh skills and KB articles. Update emails are not
+    // sent from this job; an admin triggers those and dry-run is the default.
     ctx.waitUntil(syncSkillsFromRegistry(env));
     ctx.waitUntil(syncKBFromNotion(env));
   },
 };
+
+export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN };
