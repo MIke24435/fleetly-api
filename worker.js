@@ -288,6 +288,37 @@ async function handleWaitlist(request, env) {
 // ---- KB search: query published knowledge base articles ----
 const CONTENT_DB = "00942471-34fa-49fe-af64-ea9356313b7f";
 const CONTENT_PAGE = "9ac7f508a8144300b7a967946fd7b41f";
+
+// Free-plan KV allows 1,000 puts/day. Reads are cheap, so skip a put when the
+// stored string is already the value we would write.
+async function putIfChanged(kv, key, value) {
+  let prev = null;
+  try { prev = await kv.get(key); } catch (e) { prev = null; }
+  if (prev === value) return false;
+  await kv.put(key, value);
+  return true;
+}
+
+// Deletes count against their own daily quota, so only delete a key that exists.
+async function deleteIfPresent(kv, key) {
+  let prev = null;
+  try { prev = await kv.get(key); } catch (e) { prev = null; }
+  if (prev == null) return false;
+  await kv.delete(key);
+  return true;
+}
+
+function idsFromIndex(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(e => (e && typeof e === "object" ? e.id : e)).filter(id => typeof id === "string" && id);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function syncKBFromNotion(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
   const r = await fetch("https://api.notion.com/v1/databases/" + CONTENT_PAGE + "/query", {
@@ -305,7 +336,10 @@ async function syncKBFromNotion(env) {
   if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
   const j = await r.json();
   let synced = 0;
+  let puts = 0;
+  let deleted = 0;
   const index = [];
+  const seen = new Set();
   for (const page of (j.results || [])) {
     const props = page.properties || {};
     const text = (p) => {
@@ -321,14 +355,30 @@ async function syncKBFromNotion(env) {
     const type = (props.Type && props.Type.select && props.Type.select.name) || "";
     if (!title || !body) continue;
     const id = page.id.replace(/-/g, "");
+    seen.add(id);
     const article = { id: id, title: title, type: type, body: body, keywords: keywords };
-    await env.LICENSES.put("kb:" + id, JSON.stringify(article));
+    if (await putIfChanged(env.LICENSES, "kb:" + id, JSON.stringify(article))) puts++;
     index.push({ id: id, title: title, keywords: keywords + " " + title.toLowerCase() });
     synced++;
   }
-  await env.LICENSES.put("kb:index", JSON.stringify(index));
-  await env.LICENSES.put("kb-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced };
+  // Stable order so a reshuffle from Notion does not rewrite the index.
+  index.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const indexJson = JSON.stringify(index);
+  const prevIndex = await env.LICENSES.get("kb:index");
+  if (prevIndex !== indexJson) {
+    for (const oldId of idsFromIndex(prevIndex)) {
+      if (seen.has(oldId)) continue;
+      if (await deleteIfPresent(env.LICENSES, "kb:" + oldId)) deleted++;
+    }
+    await env.LICENSES.put("kb:index", indexJson);
+    puts++;
+  }
+  // The timestamp itself is a put, so record it only when KV actually changed.
+  if (puts > 0 || deleted > 0) {
+    await env.LICENSES.put("kb-sync:last", new Date().toISOString());
+    puts++;
+  }
+  return { ok: true, synced: synced, puts: puts, deleted: deleted };
 }
 
 async function handleKBSearch(request, env) {
@@ -389,6 +439,10 @@ async function syncSkillsFromRegistry(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
   let cursor = null;
   let synced = 0;
+  let puts = 0;
+  let deleted = 0;
+  const seen = new Set();
+  const prevIndex = await env.LICENSES.get("skill-sync:index");
   do {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
@@ -429,22 +483,59 @@ async function syncSkillsFromRegistry(env) {
       const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
       const version = text("Version").trim();
       const updated = text("Updated").trim();
+      seen.add(trigger);
       // Archive the outgoing version before overwriting (rollback history).
       const prev = await env.LICENSES.get("skill:" + trigger);
       const prevVer = await env.LICENSES.get("skill-version:" + trigger);
       if (prev && prev !== clean) {
         const stamp = new Date().toISOString().split("T")[0];
         await env.LICENSES.put("skill-history:" + trigger + ":" + stamp + ":" + (prevVer || "unversioned"), prev);
+        puts++;
       }
-      await env.LICENSES.put("skill:" + trigger, clean);
-      if (version) await env.LICENSES.put("skill-version:" + trigger, version);
-      if (updated) await env.LICENSES.put("skill-updated:" + trigger, updated);
+      if (prev !== clean) {
+        await env.LICENSES.put("skill:" + trigger, clean);
+        puts++;
+      }
+      if (version) {
+        if (prevVer !== version) {
+          await env.LICENSES.put("skill-version:" + trigger, version);
+          puts++;
+        }
+      } else if (prevVer) {
+        await env.LICENSES.delete("skill-version:" + trigger);
+        deleted++;
+      }
+      const prevUpdated = await env.LICENSES.get("skill-updated:" + trigger);
+      if (updated) {
+        if (prevUpdated !== updated) {
+          await env.LICENSES.put("skill-updated:" + trigger, updated);
+          puts++;
+        }
+      } else if (prevUpdated) {
+        await env.LICENSES.delete("skill-updated:" + trigger);
+        deleted++;
+      }
       synced++;
     }
     cursor = j.has_more ? j.next_cursor : null;
   } while (cursor);
-  await env.LICENSES.put("skill-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced };
+  const triggers = Array.from(seen).sort();
+  const indexJson = JSON.stringify(triggers);
+  if (prevIndex !== indexJson) {
+    for (const old of idsFromIndex(prevIndex)) {
+      if (seen.has(old)) continue;
+      if (await deleteIfPresent(env.LICENSES, "skill:" + old)) deleted++;
+      if (await deleteIfPresent(env.LICENSES, "skill-version:" + old)) deleted++;
+      if (await deleteIfPresent(env.LICENSES, "skill-updated:" + old)) deleted++;
+    }
+    await env.LICENSES.put("skill-sync:index", indexJson);
+    puts++;
+  }
+  if (puts > 0 || deleted > 0) {
+    await env.LICENSES.put("skill-sync:last", new Date().toISOString());
+    puts++;
+  }
+  return { ok: true, synced: synced, puts: puts, deleted: deleted };
 }
 
 async function handleSkillSync(request, env) {
@@ -838,7 +929,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Hourly: pull fresh skills and KB articles.
+    // Every 6 hours. Manual sync: POST /api/admin/sync-kb and /api/admin/sync-skills.
     ctx.waitUntil(syncSkillsFromRegistry(env));
     ctx.waitUntil(syncKBFromNotion(env));
   },
