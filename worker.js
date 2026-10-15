@@ -1,18 +1,37 @@
 // Fleetly License API — serves skill instructions to licensed installs.
 // KV namespace "LICENSES" must be bound. Keys: "license:<KEY>" -> {"email","status","created"}
+// Test-mode Stripe licenses live under "test:license:<KEY>" and never share
+// email, customer, or payment indexes with live keys.
 
-const SKILL_ADDED = {
-  // added-date per trigger; skills added after a buyer's entitlement cutoff
-  // require an active membership. Update this when shipping a new skill.
-  "agent": "2026-10-08", "deactivate": "2026-10-08", "fleet": "2026-10-08",
-  "help": "2026-10-08", "load": "2026-10-08", "my-tasks": "2026-10-08",
-  "my-usage-resets": "2026-10-08", "note-is": "2026-10-08", "onboard": "2026-10-08",
-  "quota-board": "2026-10-08", "rebalance": "2026-10-08", "automatic": "2026-10-08",
-  "results-for-me": "2026-10-08", "save": "2026-10-08", "health-check": "2026-10-08",
-  "onboarding": "2026-10-08", "update-fleet": "2026-10-08",
-  "support": "2026-10-08",
-  "clean": "2026-10-08",
-};
+import {
+  adminAuthorized,
+  cancellationHtml,
+  classifyRefund,
+  isActiveLicense,
+  licenseEnding,
+  makeLicenseKey,
+  nextPurchaseDate,
+  ownsTemplateAfterCheckout,
+  publicLicenseView,
+  stripeId,
+  timedEqual,
+} from "./licensing.js";
+
+import {
+  MEMBERSHIP_REQUIRED_NOTE,
+  UPDATES_FROM,
+  UPDATE_BEGIN,
+  diffForLicense,
+  formatUpdateId,
+  isMembershipGated,
+  contentVersion,
+  kbFromContentPage,
+  makeUnsubToken,
+  nextVersionMap,
+  renderUpdateEmail,
+  skillFromRegistryPage,
+  validEmail,
+} from "./updates.js";
 
 const SKILLS = {
  "agent": "Dispatch a task. When Mike says 'Agent <name>: <prompt>' (e.g. 'Agent muse: draft the memo', 'Agent Grok Bot: summarize this'): create a row in the AI Task Queue with Task=<about five words from the prompt>, Status=Routed, Assigned AI=<named AI>, Assigned by=<your own name, or Mike if Mike said it>, Priority=Medium (High/Low if he says so), Prompt=<the prompt verbatim>; confirm in one line: 'Sent to <AI>.' Any fleet member can be named, including Grok Bot \u2014 upward delegation works exactly like downward delegation. When he says 'Agent: <prompt>' (no name): recommend the best agent yourself \u2014 strength match from the AI Fleet roster first, then quota headroom vs reset from the Usage Log, then least recently used; never invent quota figures (if stale or missing, decide on strength alone and say so) \u2014 then present your recommendation PLUS the other suitable AIs as tappable choices (only AIs suitable for this task: strength match and quota headroom, no unsuitable options); dispatch to Mike's pick and confirm 'Sent to <AI> \u2014 your pick.' or 'Sent to <AI> \u2014 my recommendation.' Efficiency: prefer free-tier AIs for suitable tasks; reserve Grok for what only it does well (real-time X/news, heavy research, Finance connector). If the request looks wasteful for the remaining quota (oversized job, re-run of settled work), say so briefly and suggest the cheaper path before dispatching.",
@@ -38,6 +57,62 @@ const SKILLS = {
 
 const LICENSE_MSG = "This Fleetly install needs a valid license key. Paste your key in the Settings database \u2192 License key field in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
 
+function http(env) {
+  return (env && typeof env.fetch === "function") ? env.fetch : fetch;
+}
+
+function nsPrefix(testMode) {
+  return testMode ? "test:" : "";
+}
+
+function licenseStorageKey(key, testMode) {
+  return nsPrefix(testMode) + "license:" + key;
+}
+
+function parseJson(raw, fallback) {
+  if (raw == null || raw === "") return fallback;
+  try { return JSON.parse(raw); } catch (e) { return fallback; }
+}
+
+async function loadLicense(env, key) {
+  if (!env || !env.LICENSES || !key) return null;
+  try {
+    const live = await env.LICENSES.get("license:" + key, "json");
+    if (live) return { record: live, test: false, storageKey: "license:" + key };
+    const testRec = await env.LICENSES.get("test:license:" + key, "json");
+    if (testRec) return { record: testRec, test: true, storageKey: "test:license:" + key };
+  } catch (e) { return null; }
+  return null;
+}
+
+// One gate for every buyer endpoint: the record must exist and be active.
+// Revoked, refunded, disputed, and deactivated keys all fail it.
+async function requireActiveLicense(env, key) {
+  const found = await loadLicense(env, key);
+  if (!isActiveLicense(found && found.record)) {
+    return { ok: false, response: json({ ok: false, error: "license", message: LICENSE_MSG }, 403) };
+  }
+  return { ok: true, record: found.record, test: found.test, storageKey: found.storageKey };
+}
+
+async function requireAdmin(request, env) {
+  const provided = request.headers.get("x-admin-secret") || "";
+  if (!await adminAuthorized(provided, env && env.ADMIN_SECRET)) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  return null;
+}
+
+async function issueUniqueLicenseKey(env, testMode) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const key = makeLicenseKey();
+    if (!env || !env.LICENSES) return key;
+    const existing = await env.LICENSES.get(licenseStorageKey(key, testMode));
+    if (!existing) return key;
+  }
+  return null;
+}
+
 // ---- Support tickets: buyer files a ticket, row lands in the
 // administrator's Notion "Support Tickets" database ----
 const TICKETS_DB = "488a9ed1-a9a3-48df-bd4f-7101d9786690";
@@ -50,14 +125,9 @@ async function handleTicket(request, env) {
   if (!key || !problem) return json({ ok: false, error: "key_and_problem_required" }, 400);
   if (problem.length > 2000) return json({ ok: false, error: "problem_too_long" }, 400);
 
-  // Validate the license key (any active or honeymoon-expired key may file).
-  let lic = null;
-  if (env.LICENSES) {
-    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-  }
-  if (!lic) return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
-  if (lic.status === "refunded" || lic.status === "disputed")
-    return json({ ok: false, error: "license", message: "This license key was refunded. If you believe this is a mistake, reply to your receipt email." }, 403);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
+  const lic = gate.record;
 
   const today = new Date().toISOString().split("T")[0];
   const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
@@ -74,7 +144,7 @@ async function handleTicket(request, env) {
   // Write the ticket into the administrator's Notion database.
   if (!env.NOTION_TOKEN) return json({ ok: false, error: "tickets_unavailable" }, 503);
   try {
-    const r = await fetch("https://api.notion.com/v1/pages", {
+    const r = await http(env)("https://api.notion.com/v1/pages", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.NOTION_TOKEN,
@@ -101,7 +171,7 @@ async function handleTicket(request, env) {
   // Notify the administrator by email.
   if (env.RESEND_API_KEY) {
     try {
-      await fetch("https://api.resend.com/emails", {
+      await http(env)("https://api.resend.com/emails", {
         method: "POST",
         headers: {
           "Authorization": "Bearer " + env.RESEND_API_KEY,
@@ -321,64 +391,62 @@ function idsFromIndex(raw) {
 
 async function syncKBFromNotion(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
-  const r = await fetch("https://api.notion.com/v1/databases/" + CONTENT_PAGE + "/query", {
-    method: "POST",
-    headers: {
-      "Authorization": "Bearer " + env.NOTION_TOKEN,
-      "Notion-Version": "2022-06-28",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      filter: { property: "Status", select: { equals: "Published" } },
-      page_size: 100,
-    }),
-  });
-  if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
-  const j = await r.json();
+  // No server-side Status filter: the operator KB uses Status = Published,
+  // and the template Knowledge Base uses a Draft checkbox. Both are applied
+  // per row so a Draft-only database still syncs.
+  const fetched = await queryAllDatabase(env, CONTENT_PAGE);
+  if (!fetched.ok) return fetched;
+  const prevCatalog = parseJson(await env.LICENSES.get("kb-catalog"), []);
   let synced = 0;
   let puts = 0;
   let deleted = 0;
   const index = [];
-  const seen = new Set();
-  for (const page of (j.results || [])) {
-    const props = page.properties || {};
-    const text = (p) => {
-      const v = props[p];
-      if (!v) return "";
-      if (v.title) return v.title.map(x => x.plain_text).join("");
-      if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
-      return "";
+  const seen = [];
+  const seenSet = new Set();
+  for (const page of fetched.pages) {
+    const article = kbFromContentPage(page);
+    if (article.skip) continue;
+    const stored = {
+      id: article.id, title: article.title, type: article.type,
+      body: article.body, keywords: article.keywords, version: article.version,
     };
-    const title = text("Title").trim();
-    const body = text("Body").trim();
-    const keywords = text("Keywords").trim().toLowerCase();
-    const type = (props.Type && props.Type.select && props.Type.select.name) || "";
-    if (!title || !body) continue;
-    const id = page.id.replace(/-/g, "");
-    seen.add(id);
-    const article = { id: id, title: title, type: type, body: body, keywords: keywords };
-    if (await putIfChanged(env.LICENSES, "kb:" + id, JSON.stringify(article))) puts++;
-    index.push({ id: id, title: title, keywords: keywords + " " + title.toLowerCase() });
+    if (await putIfChanged(env.LICENSES, "kb:" + article.id, JSON.stringify(stored))) puts++;
+    if (!seenSet.has(article.id)) {
+      seenSet.add(article.id);
+      seen.push(article.id);
+      index.push({
+        id: article.id,
+        title: article.title,
+        keywords: article.keywords + " " + article.title.toLowerCase(),
+      });
+    }
     synced++;
   }
   // Stable order so a reshuffle from Notion does not rewrite the index.
   index.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const catalog = seen.slice().sort();
+  const prevIds = Array.isArray(prevCatalog) ? prevCatalog.filter(id => typeof id === "string" && id) : [];
+  const deprecated = prevIds.filter(id => !seenSet.has(id)).sort();
   const indexJson = JSON.stringify(index);
   const prevIndex = await env.LICENSES.get("kb:index");
   if (prevIndex !== indexJson) {
     for (const oldId of idsFromIndex(prevIndex)) {
-      if (seen.has(oldId)) continue;
+      if (seenSet.has(oldId)) continue;
+      // Full page ids stay on disk so a retire notice can still read the
+      // title. Shorter ids are the pre-fix collision keys.
+      if (oldId.length === 32) continue;
       if (await deleteIfPresent(env.LICENSES, "kb:" + oldId)) deleted++;
     }
     await env.LICENSES.put("kb:index", indexJson);
     puts++;
   }
-  // The timestamp itself is a put, so record it only when KV actually changed.
+  if (await putIfChanged(env.LICENSES, "kb-catalog", JSON.stringify(catalog))) puts++;
+  if (await putIfChanged(env.LICENSES, "kb-deprecated", JSON.stringify(deprecated))) puts++;
   if (puts > 0 || deleted > 0) {
     await env.LICENSES.put("kb-sync:last", new Date().toISOString());
     puts++;
   }
-  return { ok: true, synced: synced, puts: puts, deleted: deleted };
+  return { ok: true, synced: synced, deprecated: deprecated.length, puts: puts, deleted: deleted };
 }
 
 async function handleKBSearch(request, env) {
@@ -386,13 +454,8 @@ async function handleKBSearch(request, env) {
   const key = (url.searchParams.get("key") || "").trim();
   const query = (url.searchParams.get("q") || "").replace(/\+/g, " ").trim().toLowerCase();
   if (!query) return json({ ok: false, error: "query_required" }, 400);
-  // License check (same as skills).
-  let lic = null;
-  if (env.LICENSES && key) {
-    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) {}
-  }
-  if (!lic || lic.status === "refunded" || lic.status === "disputed" || lic.status === "deactivated")
-    return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
 
   let index = [];
   try {
@@ -401,7 +464,11 @@ async function handleKBSearch(request, env) {
   } catch (e) {}
   const STOPWORDS = new Set(["what","when","where","which","who","whom","whose","how","why","is","are","was","were","be","been","being","do","does","did","doing","a","an","the","and","or","but","of","at","by","for","with","about","into","through","during","before","after","above","below","to","from","up","down","in","out","on","off","over","under","again","further","then","once","here","there","all","any","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","so","than","too","very","can","will","just","should","now","it","its","this","that","these","those","i","me","my","we","you","your","he","she","they","them","his","her","their"]);
   const terms = query.split(/\s+/).filter(w => w.length > 2 && !STOPWORDS.has(w));
-  if (terms.length === 0) return json({ ok: true, query: query, results: [] });
+  if (terms.length === 0) {
+    const empty = { ok: true, query: query, results: [] };
+    if (gate.test) empty.test = true;
+    return json(empty);
+  }
   const scored = [];
   for (const entry of index) {
     let score = 0;
@@ -423,30 +490,32 @@ async function handleKBSearch(request, env) {
       }
     } catch (e) {}
   }
-  return json({ ok: true, query: query, results: results });
+  const payload = { ok: true, query: query, results: results };
+  if (gate.test) payload.test = true;
+  return json(payload);
 }
 
 async function handleKBSync(request, env) {
-  const auth = request.headers.get("x-admin-secret") || "";
-  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-    return json({ ok: false, error: "unauthorized" }, 401);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
   return json(await syncKBFromNotion(env));
 }
 
 // ---- Skill sync: pull from the administrator's Notion registry into KV ----
-const REGISTRY_DB = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
-async function syncSkillsFromRegistry(env) {
-  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+// The scheduled sync has always queried REGISTRY_QUERY_DB. REGISTRY_DB_MISMATCH
+// was declared beside it and never passed to Notion. They are not the same
+// database. The query stays on the id production already uses.
+const REGISTRY_QUERY_DB = "4de82984-9fc8-4ee5-b269-4d5d22398504";
+const REGISTRY_DB_MISMATCH = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
+
+async function queryAllDatabase(env, databaseId) {
+  const pages = [];
   let cursor = null;
-  let synced = 0;
-  let puts = 0;
-  let deleted = 0;
-  const seen = new Set();
-  const prevIndex = await env.LICENSES.get("skill-sync:index");
+  const doFetch = http(env);
   do {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
-    const r = await fetch("https://api.notion.com/v1/databases/4de82984-9fc8-4ee5-b269-4d5d22398504/query", {
+    const r = await doFetch("https://api.notion.com/v1/databases/" + databaseId + "/query", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.NOTION_TOKEN,
@@ -457,103 +526,104 @@ async function syncSkillsFromRegistry(env) {
     });
     if (!r.ok) return { ok: false, error: "notion_query_failed", status: r.status };
     const j = await r.json();
-    for (const page of (j.results || [])) {
-      const props = page.properties || {};
-      const text = (p) => {
-        const v = props[p];
-        if (!v) return "";
-        if (v.title) return v.title.map(x => x.plain_text).join("");
-        if (v.rich_text) return v.rich_text.map(x => x.plain_text).join("");
-        return "";
-      };
-      const skill = text("Skill").trim();
-      let trigger = text("Trigger").trim().replace(/:$/, "").replace(/\s+/g, "-").toLowerCase();
-      const instructions = text("Instructions").trim();
-      const appliesTo = text("Applies to").trim().toLowerCase();
-      // Draft checkbox (or Draft in the name) means not ready — skip it.
-      const draftProp = props["Draft"];
-      const isDraft = (draftProp && draftProp.checkbox === true)
-        || /\bdraft\b/i.test(skill);
-      if (isDraft) continue;
-      // Only sync user-facing skills with real instructions.
-      if (!trigger || !instructions || instructions.length < 20) continue;
-      if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) continue;
-      // De-Mike: buyer-facing text uses "the user", never "Mike".
-      // De-Mike: buyer-facing text uses "the user", never "Mike".
-      const clean = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
-      const version = text("Version").trim();
-      const updated = text("Updated").trim();
-      seen.add(trigger);
-      // Archive the outgoing version before overwriting (rollback history).
-      const prev = await env.LICENSES.get("skill:" + trigger);
-      const prevVer = await env.LICENSES.get("skill-version:" + trigger);
-      if (prev && prev !== clean) {
-        const stamp = new Date().toISOString().split("T")[0];
-        await env.LICENSES.put("skill-history:" + trigger + ":" + stamp + ":" + (prevVer || "unversioned"), prev);
-        puts++;
-      }
-      if (prev !== clean) {
-        await env.LICENSES.put("skill:" + trigger, clean);
-        puts++;
-      }
-      if (version) {
-        if (prevVer !== version) {
-          await env.LICENSES.put("skill-version:" + trigger, version);
-          puts++;
-        }
-      } else if (prevVer) {
-        await env.LICENSES.delete("skill-version:" + trigger);
-        deleted++;
-      }
-      const prevUpdated = await env.LICENSES.get("skill-updated:" + trigger);
-      if (updated) {
-        if (prevUpdated !== updated) {
-          await env.LICENSES.put("skill-updated:" + trigger, updated);
-          puts++;
-        }
-      } else if (prevUpdated) {
-        await env.LICENSES.delete("skill-updated:" + trigger);
-        deleted++;
-      }
-      synced++;
-    }
+    for (const page of (j.results || [])) pages.push(page);
     cursor = j.has_more ? j.next_cursor : null;
   } while (cursor);
-  const triggers = Array.from(seen).sort();
-  const indexJson = JSON.stringify(triggers);
-  if (prevIndex !== indexJson) {
-    for (const old of idsFromIndex(prevIndex)) {
-      if (seen.has(old)) continue;
-      if (await deleteIfPresent(env.LICENSES, "skill:" + old)) deleted++;
-      if (await deleteIfPresent(env.LICENSES, "skill-version:" + old)) deleted++;
-      if (await deleteIfPresent(env.LICENSES, "skill-updated:" + old)) deleted++;
+  return { ok: true, pages: pages };
+}
+
+function sameStringSet(left, right) {
+  if (left.length !== right.length) return false;
+  const set = new Set(right);
+  for (const item of left) {
+    if (!set.has(item)) return false;
+  }
+  return true;
+}
+
+function stringList(raw) {
+  const parsed = parseJson(raw, []);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter(item => typeof item === "string" && item);
+}
+
+async function syncSkillsFromRegistry(env) {
+  if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
+  const fetched = await queryAllDatabase(env, REGISTRY_QUERY_DB);
+  if (!fetched.ok) return fetched;
+  const prevSlugs = stringList(await env.LICENSES.get("skill-index"));
+  const seen = [];
+  const seenSet = new Set();
+  let synced = 0;
+  let puts = 0;
+  for (const page of fetched.pages) {
+    const row = skillFromRegistryPage(page.properties || {});
+    if (row.skip) continue;
+    const prev = await env.LICENSES.get("skill:" + row.slug);
+    const prevVer = await env.LICENSES.get("skill-version:" + row.slug);
+    if (prev && prev !== row.text) {
+      const stamp = new Date().toISOString().split("T")[0];
+      await env.LICENSES.put(
+        "skill-history:" + row.slug + ":" + stamp + ":" + (prevVer || "unversioned"),
+        prev);
+      puts++;
     }
-    await env.LICENSES.put("skill-sync:index", indexJson);
+    if (await putIfChanged(env.LICENSES, "skill:" + row.slug, row.text)) puts++;
+    if (row.explicitVersion) {
+      if (await putIfChanged(env.LICENSES, "skill-version:" + row.slug, row.explicitVersion)) puts++;
+    }
+    if (row.updated) {
+      if (await putIfChanged(env.LICENSES, "skill-updated:" + row.slug, row.updated)) puts++;
+    }
+    // Empty string when the registry row has no Added date. The gate treats
+    // that as new. A missing key (never synced) is the same fail-safe.
+    if (await putIfChanged(env.LICENSES, "skill-added:" + row.slug, row.added || "")) puts++;
+    const record = {
+      slug: row.slug,
+      match: row.match,
+      version: row.version,
+      added: row.added || "",
+      text: row.text,
+      deprecated: false,
+    };
+    if (await putIfChanged(env.LICENSES, "skill-record:" + row.slug, JSON.stringify(record))) puts++;
+    if (!seenSet.has(row.slug)) {
+      seenSet.add(row.slug);
+      seen.push(row.slug);
+    }
+    synced++;
+  }
+  const deprecated = prevSlugs.filter(slug => !seenSet.has(slug));
+  for (const slug of deprecated) {
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec || rec.deprecated === true) continue;
+    rec.deprecated = true;
+    if (await putIfChanged(env.LICENSES, "skill-record:" + slug, JSON.stringify(rec))) puts++;
+  }
+  // Keep the stored slug order when the set is unchanged, so a Notion
+  // reshuffle does not spend a put. skill-history keys are never deleted.
+  if (!sameStringSet(prevSlugs, seen)) {
+    await env.LICENSES.put("skill-index", JSON.stringify(seen));
     puts++;
   }
-  if (puts > 0 || deleted > 0) {
+  if (!sameStringSet(stringList(await env.LICENSES.get("skill-deprecated")), deprecated)) {
+    await env.LICENSES.put("skill-deprecated", JSON.stringify(deprecated));
+    puts++;
+  }
+  if (puts > 0) {
     await env.LICENSES.put("skill-sync:last", new Date().toISOString());
     puts++;
   }
-  return { ok: true, synced: synced, puts: puts, deleted: deleted };
+  return { ok: true, synced: synced, deprecated: deprecated.length, puts: puts };
 }
 
 async function handleSkillSync(request, env) {
-  const auth = request.headers.get("x-admin-secret") || "";
-  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-    return json({ ok: false, error: "unauthorized" }, 401);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
   return json(await syncSkillsFromRegistry(env));
 }
 
 // ---- Stripe webhook: automatic license issuance ----
-function makeLicenseKey() {
-  const bytes = crypto.getRandomValues(new Uint8Array(10));
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no confusing chars
-  let s = "";
-  for (const b of bytes) s += alphabet[b % alphabet.length];
-  return "FL-" + s.slice(0, 5) + "-" + s.slice(5);
-}
-
 async function verifyStripeSig(rawBody, sigHeader, secret) {
   if (!sigHeader || !secret) return false;
   const parts = {};
@@ -572,14 +642,8 @@ async function verifyStripeSig(rawBody, sigHeader, secret) {
   const hex = [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, "0")).join("");
   return timedEqual(hex, parts.v1);
 }
-function timedEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let d = 0;
-  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return d === 0;
-}
 
-async function sendKeyEmail(env, email, key, plan, isNew) {
+async function sendKeyEmail(env, email, key, plan, isNew, testMode) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: "no_api_key_or_email" };
   const isMembershipRenewal = plan === "membership" && !isNew;
   const productLine = plan === "membership"
@@ -601,7 +665,7 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
     <p>Questions? Reply to this email.</p>
     <p>— The Fleetly team</p>`;
   try {
-    const r = await fetch("https://api.resend.com/emails", {
+    const r = await http(env)("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.RESEND_API_KEY,
@@ -610,7 +674,7 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
       body: JSON.stringify({
         from: "Fleetly <hello@fleetlybots.com>",
         to: [email],
-        subject: isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key",
+        subject: (testMode ? "[TEST] " : "") + (isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key"),
         html: html,
       }),
     });
@@ -621,192 +685,748 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
   }
 }
 
-async function handleStripeWebhook(request, env) {
-  const sig = request.headers.get("stripe-signature");
-  const rawBody = await request.text();
-  if (!await verifyStripeSig(rawBody, sig, env.STRIPE_WEBHOOK_SECRET)) {
-    return json({ ok: false, error: "bad_signature" }, 400);
-  }
-  let event;
-  try { event = JSON.parse(rawBody); } catch (e) { return json({ ok: false }, 400); }
+async function claimStripeEvent(env, eventId, testMode) {
+  if (!env.LICENSES || !eventId) return { duplicate: false };
+  const name = nsPrefix(testMode) + "stripe-event:" + eventId;
+  const seen = await env.LICENSES.get(name);
+  if (seen) return { duplicate: true };
+  // Claim before any license write or email so a fast retry cannot send twice.
+  await env.LICENSES.put(name, "processing", { expirationTtl: 86400 * 30 });
+  return { duplicate: false };
+}
 
-  // Idempotency: Stripe retries deliveries; never issue twice for one event.
+async function finishStripeEvent(env, eventId, testMode) {
+  if (!env.LICENSES || !eventId) return;
+  const name = nsPrefix(testMode) + "stripe-event:" + eventId;
+  await env.LICENSES.put(name, "done", { expirationTtl: 86400 * 30 });
+}
+
+async function loadByCustomer(env, customer, testMode) {
+  if (!env.LICENSES || !customer) return null;
+  const key = await env.LICENSES.get(nsPrefix(testMode) + "license-customer:" + customer);
+  if (!key) return null;
+  const storageKey = licenseStorageKey(key, testMode);
+  const record = await env.LICENSES.get(storageKey, "json");
+  if (!record) return null;
+  return { key: key, record: record, storageKey: storageKey, test: !!testMode };
+}
+
+async function sendMembershipEmail(env, email, key, testMode, subject, html) {
+  if (!email || !env.RESEND_API_KEY || !html) return { sent: false };
+  try {
+    const r = await http(env)("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.RESEND_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Fleetly <hello@fleetlybots.com>",
+        to: [email],
+        subject: (testMode ? "[TEST] " : "") + subject,
+        html: html,
+      }),
+    });
+    return { sent: !!r.ok };
+  } catch (e) {
+    return { sent: false };
+  }
+}
+
+async function handleCheckoutCompleted(obj, env, testMode) {
+  const email = ((obj.customer_details && obj.customer_details.email) || obj.customer_email || "").trim();
+  const name = (obj.customer_details && obj.customer_details.name) || "";
+  const mode = obj.mode === "subscription" ? "subscription" : "payment";
+  const today = new Date().toISOString().split("T")[0];
+  const prefix = nsPrefix(testMode);
+  let key = "";
+  let record = null;
+  let isNew = false;
+  if (env.LICENSES && email) {
+    key = await env.LICENSES.get(prefix + "license-email:" + email.toLowerCase());
+    if (key) record = await env.LICENSES.get(licenseStorageKey(key, testMode), "json");
+  }
+  if (!record) {
+    key = await issueUniqueLicenseKey(env, testMode);
+    if (!key) return json({ ok: false, error: "key_collision" }, 500);
+    record = {
+      email: email,
+      name: name,
+      status: "active",
+      created: today,
+      purchased: today,
+      stripe_customer: stripeId(obj.customer),
+      test: !!testMode,
+    };
+    isNew = true;
+  }
+  record.email = email || record.email;
+  if (name) record.name = name;
+  if (obj.customer) record.stripe_customer = stripeId(obj.customer);
+  record.test = !!testMode;
+  record.purchased = nextPurchaseDate(record, mode, today, isNew);
+  record.owns_template = ownsTemplateAfterCheckout(record, mode);
+  record.status = "active";
+  record.plan = mode === "subscription" ? "membership" : "template";
+  record.stripe_session = obj.id || "";
+  const paymentIntent = stripeId(obj.payment_intent);
+  const subscriptionId = stripeId(obj.subscription);
+  if (paymentIntent) record.stripe_payment_intent = paymentIntent;
+  if (subscriptionId) record.stripe_subscription = subscriptionId;
   if (env.LICENSES) {
-    const seen = await env.LICENSES.get("stripe-event:" + event.id);
-    if (seen) return json({ ok: true, deduped: true });
+    await env.LICENSES.put(licenseStorageKey(key, testMode), JSON.stringify(record));
+    if (email) await env.LICENSES.put(prefix + "license-email:" + email.toLowerCase(), key);
+    if (record.stripe_customer) {
+      await env.LICENSES.put(prefix + "license-customer:" + record.stripe_customer, key);
+    }
+    const mapping = JSON.stringify({
+      key: key,
+      product: mode === "subscription" ? "membership" : "template",
+    });
+    if (obj.id) await env.LICENSES.put(prefix + "stripe-checkout:" + obj.id, mapping);
+    if (paymentIntent) await env.LICENSES.put(prefix + "stripe-payment:" + paymentIntent, mapping);
+    if (subscriptionId) await env.LICENSES.put(prefix + "stripe-subscription:" + subscriptionId, mapping);
   }
-
-  const type = event.type;
-  const obj = event.data && event.data.object ? event.data.object : {};
-
-  if (type === "checkout.session.completed") {
-    const email = (obj.customer_details && obj.customer_details.email) || obj.customer_email || "";
-    const name = (obj.customer_details && obj.customer_details.name) || "";
-    const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
-    const today = new Date().toISOString().split("T")[0];
-    // One key per buyer: look up any existing license by email first.
-    let key = "";
-    let record = null;
-    let isNew = false;
-    if (env.LICENSES && email) {
-      key = await env.LICENSES.get("license-email:" + email.toLowerCase());
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
-    if (!record) {
-      key = makeLicenseKey();
-      record = { email: email, name: name, status: "active", created: today,
-        purchased: today, stripe_customer: obj.customer || "" };
-      isNew = true;
-    }
-    record.email = email || record.email;
-    if (name) record.name = name;
-    if (obj.customer) record.stripe_customer = obj.customer;
-    record.status = "active";
-    if (mode === "subscription") {
-      // Membership: unlocks all skills while subscribed.
-      record.plan = "membership";
-    } else {
-      // Template: new skills free for 6 months from purchase; core skills forever.
-      record.plan = "template";
-      record.purchased = today;
-    }
-    record.stripe_session = obj.id;
-    if (env.LICENSES) {
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
-      await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-      if (email) await env.LICENSES.put("license-email:" + email.toLowerCase(), key);
-      if (record.stripe_customer) await env.LICENSES.put("license-customer:" + record.stripe_customer, key);
-    }
-    // Deliver the key by email (automatic). Key issuance above already
-    // succeeded, so a mail failure never blocks the license itself.
-    const mail = await sendKeyEmail(env, email, key, record.plan, isNew);
-    if (env.LICENSES && !mail.sent) {
-      await env.LICENSES.put("license-email-pending:" + key,
-        JSON.stringify({ email: email, reason: mail.reason }));
-    }
-    return json({ ok: true, issued: true, email_sent: mail.sent });
+  const mail = await sendKeyEmail(env, email, key, record.plan, isNew, testMode);
+  if (env.LICENSES && !mail.sent) {
+    await env.LICENSES.put(prefix + "license-email-pending:" + key,
+      JSON.stringify({ email: email, reason: mail.reason }));
   }
+  return json({ ok: true, issued: true, email_sent: mail.sent, test: !!testMode });
+}
 
-  if (type === "charge.refunded") {
-    // $49 template refunded (or $6 charge refunded): revoke the license.
-    const pi = obj.payment_intent || "";
-    let key = "";
-    let record = null;
-    if (env.LICENSES && pi) {
-      // Find via the charge's receipt email.
-      const email = (obj.receipt_email || "").toLowerCase();
-      if (email) key = await env.LICENSES.get("license-email:" + email);
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
-    if (record) {
-      record.status = "refunded";
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
-    }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    return json({ ok: true, revoked: !!record });
+async function resolveRefundTarget(obj, env, testMode) {
+  const prefix = nsPrefix(testMode);
+  const paymentIntent = stripeId(obj.payment_intent);
+  let mapping = null;
+  if (env.LICENSES && paymentIntent) {
+    mapping = parseJson(await env.LICENSES.get(prefix + "stripe-payment:" + paymentIntent), null);
   }
+  let key = mapping && mapping.key ? mapping.key : "";
+  if (!key && env.LICENSES && obj.customer) {
+    key = await env.LICENSES.get(prefix + "license-customer:" + stripeId(obj.customer)) || "";
+  }
+  return { key: key, mapping: mapping };
+}
 
-  if (type === "charge.dispute.created") {
-    // Chargeback: treat like a refund — revoke the license.
+async function handleChargeRefunded(obj, env, testMode) {
+  const target = await resolveRefundTarget(obj, env, testMode);
+  if (!target.key || !env.LICENSES) return json({ ok: true, revoked: false, reason: "no_mapping" });
+  const storageKey = licenseStorageKey(target.key, testMode);
+  const record = await env.LICENSES.get(storageKey, "json");
+  if (!record) return json({ ok: true, revoked: false, reason: "no_license" });
+  const decision = classifyRefund(obj, target.mapping);
+  if (decision.action === "revoke") {
+    record.status = "revoked";
+    record.revoked_at = new Date().toISOString().split("T")[0];
+    record.revoke_reason = "full refund of template purchase";
+    await env.LICENSES.put(storageKey, JSON.stringify(record));
+    return json({ ok: true, revoked: true, test: !!testMode });
+  }
+  if (decision.action === "drop_membership") {
+    record.plan = "template";
+    if (record.status !== "revoked" && record.status !== "disputed") record.status = "active";
+    await env.LICENSES.put(storageKey, JSON.stringify(record));
+    return json({ ok: true, membership_dropped: true, test: !!testMode });
+  }
+  return json({ ok: true, ignored: decision.reason || "refund" });
+}
+
+async function handleDisputeCreated(obj, env, testMode) {
+  const prefix = nsPrefix(testMode);
+  let key = "";
+  const paymentIntent = stripeId(obj.payment_intent);
+  if (env.LICENSES && paymentIntent) {
+    const mapping = parseJson(await env.LICENSES.get(prefix + "stripe-payment:" + paymentIntent), null);
+    if (mapping && mapping.key) key = mapping.key;
+  }
+  if (!key && env.LICENSES && obj.customer) {
+    key = await env.LICENSES.get(prefix + "license-customer:" + stripeId(obj.customer)) || "";
+  }
+  if (!key && env.LICENSES) {
     const email = (obj.billing_details && obj.billing_details.email || "").toLowerCase();
-    let key = "";
-    let record = null;
-    if (env.LICENSES && email) {
-      key = await env.LICENSES.get("license-email:" + email);
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
+    if (email) key = await env.LICENSES.get(prefix + "license-email:" + email) || "";
+  }
+  if (key && env.LICENSES) {
+    const storageKey = licenseStorageKey(key, testMode);
+    const record = await env.LICENSES.get(storageKey, "json");
     if (record) {
       record.status = "disputed";
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
+      await env.LICENSES.put(storageKey, JSON.stringify(record));
+      return json({ ok: true, revoked: true, test: !!testMode });
     }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    return json({ ok: true, revoked: !!record });
   }
+  return json({ ok: true, revoked: false });
+}
 
-  if (type === "customer.subscription.updated" && obj.cancel_at_period_end && obj.status === "active") {
-    // Membership cancelled but runs to period end: confirm immediately.
-    const customer = obj.customer || "";
-    let key = "";
-    let email = "";
-    if (env.LICENSES && customer) {
-      key = await env.LICENSES.get("license-customer:" + customer);
-      if (key) {
-        const rec = await env.LICENSES.get("license:" + key, "json");
-        if (rec) email = rec.email || "";
-      }
-    }
+async function handleSubscriptionUpdated(obj, env, testMode) {
+  const loaded = await loadByCustomer(env, stripeId(obj.customer), testMode);
+  if (obj.cancel_at_period_end && obj.status === "active") {
     const periodEnd = obj.cancel_at
       ? new Date(obj.cancel_at * 1000).toISOString().split("T")[0] : "";
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    if (email && env.RESEND_API_KEY) {
-      try {
-        await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + env.RESEND_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            from: "Fleetly <hello@fleetlybots.com>",
-            to: [email],
-            subject: "Your Fleetly membership is cancelled",
-            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
-              + (periodEnd ? `<p>It stays active through <strong>${periodEnd}</strong>.</p>` : "")
-              + (key ? `<p>Your license key <strong>${key}</strong> keeps working after that: your template and core skills are yours, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
-              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
-              + `<p>— The Fleetly team</p>`,
-          }),
-        });
-      } catch (e) { /* cancellation stands even if the email fails */ }
+    if (loaded && loaded.record.email) {
+      const html = cancellationHtml(loaded.key, [
+        "Your Fleetly membership is cancelled — you won't be charged again.",
+        periodEnd ? "It stays active through <strong>" + periodEnd + "</strong>." : "",
+        "The key keeps working after that: the template and core skills stay, and any refinements to them. Only brand-new skills released after the included period need an active membership.",
+        "Thanks for trying Fleetly. If you ever want back in, you know where to find us.",
+      ].filter(Boolean));
+      await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+        "Your Fleetly membership is cancelled", html);
     }
     return json({ ok: true, cancel_scheduled: true });
   }
-
-  if (type === "customer.subscription.deleted") {
-    // $6/mo cancelled: find the license by customer and deactivate it.
-    const customer = obj.customer || "";
-    let key = "";
-    let email = "";
-    if (env.LICENSES && customer) {
-      key = await env.LICENSES.get("license-customer:" + customer);
-      if (key) {
-        const rec = await env.LICENSES.get("license:" + key, "json");
-        if (rec) {
-          email = rec.email || "";
-          // Back to the template plan: core skills keep working, new skills
-          // gate on the original 6-month window from purchase.
-          rec.plan = "template";
-          rec.status = "active";
-          await env.LICENSES.put("license:" + key, JSON.stringify(rec));
-        }
+  if (loaded && (obj.status === "past_due" || obj.status === "unpaid")) {
+    // Same plan change as cancellation, including buyers who only ever
+    // bought the membership. Whether that honeymoon is right is an owner
+    // pricing decision.
+    if (loaded.record.plan !== "template") {
+      loaded.record.plan = "template";
+      loaded.record.status = "active";
+      await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+      if (loaded.record.email) {
+        const html = cancellationHtml(loaded.key, [
+          "Your Fleetly membership isn't active while the payment is " + String(obj.status).replace(/_/g, " ") + ".",
+          "The template and the skills from your purchase keep working. A membership is only needed for brand-new skills released after the included period.",
+        ]);
+        await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+          "Your Fleetly membership payment needs attention", html);
       }
     }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    // Confirm the cancellation by email so the buyer isn't left wondering.
-    if (email && env.RESEND_API_KEY) {
-      try {
-        await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + env.RESEND_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            from: "Fleetly <hello@fleetlybots.com>",
-            to: [email],
-            subject: "Your Fleetly membership is cancelled",
-            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
-              + (key ? `<p>Your license key <strong>${key}</strong> still works: your template and core skills keep working, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
-              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
-              + `<p>— The Fleetly team</p>`,
-          }),
-        });
-      } catch (e) { /* cancellation stands even if the email fails */ }
+    return json({ ok: true, membership_dropped: true, status: obj.status });
+  }
+  if (loaded && (obj.status === "active" || obj.status === "trialing") && loaded.record.plan !== "membership") {
+    loaded.record.plan = "membership";
+    loaded.record.status = "active";
+    await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+    return json({ ok: true, membership_restored: true });
+  }
+  return json({ ok: true, ignored: "subscription.updated" });
+}
+
+async function handleSubscriptionDeleted(obj, env, testMode) {
+  const loaded = await loadByCustomer(env, stripeId(obj.customer), testMode);
+  if (loaded) {
+    loaded.record.plan = "template";
+    loaded.record.status = "active";
+    await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+    if (loaded.record.email) {
+      const html = cancellationHtml(loaded.key, [
+        "Your Fleetly membership is cancelled — you won't be charged again.",
+        "The key still works: the template and core skills keep working, and any refinements to them. Only brand-new skills released after the included period need an active membership.",
+        "Thanks for trying Fleetly. If you ever want back in, you know where to find us.",
+      ]);
+      await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+        "Your Fleetly membership is cancelled", html);
     }
-    return json({ ok: true });
+  }
+  return json({ ok: true });
+}
+
+async function dispatchStripeEvent(event, env, testMode) {
+  const type = event.type;
+  const obj = event.data && event.data.object ? event.data.object : {};
+  if (type === "checkout.session.completed") return handleCheckoutCompleted(obj, env, testMode);
+  if (type === "charge.refunded") return handleChargeRefunded(obj, env, testMode);
+  if (type === "charge.dispute.created") return handleDisputeCreated(obj, env, testMode);
+  if (type === "customer.subscription.updated") return handleSubscriptionUpdated(obj, env, testMode);
+  if (type === "customer.subscription.deleted") return handleSubscriptionDeleted(obj, env, testMode);
+  return json({ ok: true, ignored: type });
+}
+
+async function handleStripeWebhook(request, env) {
+  const sig = request.headers.get("stripe-signature");
+  const rawBody = await request.text();
+  let event;
+  try { event = JSON.parse(rawBody); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const testMode = event.livemode === false;
+  const secret = testMode ? env.STRIPE_WEBHOOK_SECRET_TEST : env.STRIPE_WEBHOOK_SECRET;
+  if (testMode && !secret) return json({ ok: false, error: "test_mode_not_configured" }, 400);
+  if (!await verifyStripeSig(rawBody, sig, secret)) {
+    return json({ ok: false, error: "bad_signature" }, 400);
+  }
+  if (!event.id) return json({ ok: false, error: "missing_event_id" }, 400);
+  const claim = await claimStripeEvent(env, event.id, testMode);
+  if (claim.duplicate) return json({ ok: true, deduped: true });
+  try {
+    return await dispatchStripeEvent(event, env, testMode);
+  } finally {
+    await finishStripeEvent(env, event.id, testMode);
+  }
+}
+
+async function handleCreateKey(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const testMode = body.test === true;
+  const email = String(body.email || "manual@fleetlybots.com").trim();
+  const plan = body.plan === "membership" ? "membership" : "template";
+  const key = await issueUniqueLicenseKey(env, testMode);
+  if (!key) return json({ ok: false, error: "key_collision" }, 500);
+  const today = new Date().toISOString().split("T")[0];
+  const rec = {
+    email: email,
+    name: body.name ? String(body.name).slice(0, 200) : "",
+    status: "active",
+    plan: plan,
+    purchased: today,
+    created: new Date().toISOString(),
+    note: body.note ? String(body.note).slice(0, 500) : "manual",
+    owns_template: plan === "template",
+    test: testMode,
+  };
+  await env.LICENSES.put(licenseStorageKey(key, testMode), JSON.stringify(rec));
+  if (email) {
+    await env.LICENSES.put(nsPrefix(testMode) + "license-email:" + email.toLowerCase(), key);
+  }
+  return json({ ok: true, key: key, test: testMode });
+}
+
+async function handleLookup(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const key = String(body.key || "").trim();
+  if (!key) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, key);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(key) }, 404);
+  try {
+    return json(publicLicenseView(found.record, key, found.test));
+  } catch (e) {
+    return json({ ok: false, error: "redaction_failed", license_ending: licenseEnding(key) }, 500);
+  }
+}
+
+async function handleRevoke(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const key = String(body.key || "").trim();
+  const reason = String(body.reason || "").trim().slice(0, 500);
+  if (!key) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, key);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(key) }, 404);
+  if (!reason && found.record.status !== "revoked") {
+    return json({ ok: false, error: "reason_required" }, 400);
+  }
+  const today = new Date().toISOString().split("T")[0];
+  if (found.record.status !== "revoked") {
+    found.record.status = "revoked";
+    found.record.revoked_at = today;
+    found.record.revoke_reason = reason;
+    await env.LICENSES.put(found.storageKey, JSON.stringify(found.record));
+  }
+  const payload = {
+    ok: true,
+    license_ending: licenseEnding(key),
+    status: "revoked",
+    revoked_at: found.record.revoked_at || "",
+    revoke_reason: found.record.revoke_reason || "",
+    test: found.test,
+  };
+  if (key.length > 4 && JSON.stringify(payload).includes(key)) {
+    return json({ ok: false, error: "redaction_failed" }, 500);
+  }
+  return json(payload);
+}
+
+async function handleRotate(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const oldKey = String(body.key || "").trim();
+  if (!oldKey) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, oldKey);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(oldKey) }, 404);
+  if (found.record.status === "revoked") {
+    return json({ ok: false, error: "revoked", license_ending: licenseEnding(oldKey) }, 409);
+  }
+  const testMode = found.test;
+  const newKey = await issueUniqueLicenseKey(env, testMode);
+  if (!newKey) return json({ ok: false, error: "key_collision" }, 500);
+  const today = new Date().toISOString().split("T")[0];
+  const fresh = {
+    email: found.record.email || "",
+    name: found.record.name || "",
+    status: "active",
+    plan: found.record.plan || "template",
+    purchased: found.record.purchased || today,
+    created: today,
+    stripe_customer: found.record.stripe_customer || "",
+    stripe_subscription: found.record.stripe_subscription || "",
+    stripe_payment_intent: found.record.stripe_payment_intent || "",
+    stripe_session: found.record.stripe_session || "",
+    owns_template: found.record.owns_template === true,
+    note: found.record.note || "",
+    test: testMode,
+    rotated_from_ending: licenseEnding(oldKey),
+  };
+  found.record.status = "deactivated";
+  found.record.deactivated_at = today;
+  found.record.deactivate_reason = "rotated";
+  found.record.rotated_to_ending = licenseEnding(newKey);
+  const prefix = nsPrefix(testMode);
+  await env.LICENSES.put(licenseStorageKey(newKey, testMode), JSON.stringify(fresh));
+  await env.LICENSES.put(found.storageKey, JSON.stringify(found.record));
+  if (fresh.email) await env.LICENSES.put(prefix + "license-email:" + fresh.email.toLowerCase(), newKey);
+  if (fresh.stripe_customer) await env.LICENSES.put(prefix + "license-customer:" + fresh.stripe_customer, newKey);
+  const product = fresh.owns_template ? "template" : "membership";
+  if (fresh.stripe_payment_intent) {
+    await env.LICENSES.put(prefix + "stripe-payment:" + fresh.stripe_payment_intent,
+      JSON.stringify({ key: newKey, product: product }));
+  }
+  if (fresh.stripe_session) {
+    await env.LICENSES.put(prefix + "stripe-checkout:" + fresh.stripe_session,
+      JSON.stringify({ key: newKey, product: product }));
+  }
+  if (fresh.stripe_subscription) {
+    await env.LICENSES.put(prefix + "stripe-subscription:" + fresh.stripe_subscription,
+      JSON.stringify({ key: newKey, product: "membership" }));
+  }
+  const mail = await sendKeyEmail(env, fresh.email, newKey, fresh.plan, true, testMode);
+  return json({
+    ok: true,
+    key: newKey,
+    license_ending: licenseEnding(newKey),
+    previous_ending: licenseEnding(oldKey),
+    email_sent: mail.sent,
+    test: testMode,
+  });
+}
+
+// ---- OTA skill/KB update emails ----
+// Buyers register a Coordinator inbox. An admin run (dry-run by default)
+// emails that inbox the rows that changed since the license's last send.
+// The scheduled sync does not send mail.
+
+function updatesFrom(env) {
+  return (env && env.UPDATES_FROM) || UPDATES_FROM;
+}
+
+function updatesBase(env) {
+  return ((env && env.UPDATES_PUBLIC_BASE) || "https://api.fleetlybots.com").replace(/\/$/, "");
+}
+
+// Broadcast walks live licenses only. A test key is included when the
+// admin names it, and loadLicense keeps that record in the test namespace.
+async function listLicenseKeys(env) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.LICENSES.list({ prefix: "license:", cursor: cursor, limit: 1000 });
+    for (const entry of (page.keys || [])) {
+      const name = entry.name.startsWith("license:") ? entry.name.slice("license:".length) : "";
+      if (name) keys.push(name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return keys;
+}
+
+async function loadUpdateCatalog(env) {
+  const items = [];
+  const skillIndex = parseJson(await env.LICENSES.get("skill-index"), []);
+  const skillDeprecated = parseJson(await env.LICENSES.get("skill-deprecated"), []);
+  for (const slug of skillIndex) {
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec || rec.deprecated) continue;
+    items.push({
+      storageKey: "skill:" + slug,
+      type: "skill",
+      match: rec.match,
+      version: rec.version || contentVersion("", rec.text),
+      added: rec.added || "",
+      text: rec.text,
+      deprecated: false,
+    });
+  }
+  for (const slug of skillDeprecated) {
+    if (skillIndex.includes(slug)) continue;
+    const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
+    if (!rec) continue;
+    items.push({
+      storageKey: "skill:" + slug,
+      type: "skill",
+      match: rec.match,
+      version: rec.version || contentVersion("", rec.text),
+      added: rec.added || "",
+      text: rec.text,
+      deprecated: true,
+    });
+  }
+  const kbCatalog = parseJson(await env.LICENSES.get("kb-catalog"), []);
+  const kbDeprecated = parseJson(await env.LICENSES.get("kb-deprecated"), []);
+  for (const id of kbCatalog) {
+    const article = parseJson(await env.LICENSES.get("kb:" + id), null);
+    if (!article) continue;
+    items.push({
+      storageKey: "kb:" + id,
+      type: "kb",
+      match: article.title,
+      version: article.version || contentVersion("", article.body),
+      added: "",
+      text: article.body,
+      deprecated: false,
+    });
+  }
+  for (const id of kbDeprecated) {
+    if (kbCatalog.includes(id)) continue;
+    const article = parseJson(await env.LICENSES.get("kb:" + id), null);
+    if (!article) continue;
+    items.push({
+      storageKey: "kb:" + id,
+      type: "kb",
+      match: article.title,
+      version: article.version || contentVersion("", article.body),
+      added: "",
+      text: article.body,
+      deprecated: true,
+    });
+  }
+  return items;
+}
+
+async function peekUpdateId(env, date) {
+  const ymd = date.replace(/-/g, "");
+  const n = parseInt(await env.LICENSES.get("updates-seq:" + ymd) || "0", 10) + 1;
+  return formatUpdateId(date, n);
+}
+
+async function reserveUpdateId(env, date) {
+  const ymd = date.replace(/-/g, "");
+  const n = parseInt(await env.LICENSES.get("updates-seq:" + ymd) || "0", 10) + 1;
+  await env.LICENSES.put("updates-seq:" + ymd, String(n));
+  return formatUpdateId(date, n);
+}
+
+async function ensureUnsubToken(env, key, lic, testMode) {
+  if (lic.updates_unsub_token) return lic.updates_unsub_token;
+  const token = makeUnsubToken();
+  lic.updates_unsub_token = token;
+  const prefix = nsPrefix(!!testMode);
+  await env.LICENSES.put(prefix + "license:" + key, JSON.stringify(lic));
+  await env.LICENSES.put(prefix + "updates-unsub:" + token, key);
+  return token;
+}
+
+async function sendUpdateEmail(env, to, rendered, unsubscribeUrl) {
+  const doFetch = http(env);
+  const payload = {
+    from: updatesFrom(env),
+    to: [to],
+    subject: rendered.subject,
+    text: rendered.text,
+    html: rendered.html,
+  };
+  if (unsubscribeUrl) {
+    payload.headers = { "List-Unsubscribe": "<" + unsubscribeUrl + ">" };
+  }
+  const r = await doFetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + env.RESEND_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return { sent: r.ok, status: r.status };
+}
+
+async function handleCoordinator(request, env) {
+  if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const key = (body.key || "").trim();
+  const email = (body.email || "").trim();
+  if (!key || !email) return json({ ok: false, error: "key_and_email_required" }, 400);
+  if (!validEmail(email)) return json({ ok: false, error: "bad_email" }, 400);
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
+  const lic = gate.record;
+  lic.coordinator_email = email;
+  await ensureUnsubToken(env, key, lic, gate.test);
+  await env.LICENSES.put(gate.storageKey, JSON.stringify(lic));
+  const resp = { ok: true };
+  if (gate.test) resp.test = true;
+  return json(resp);
+}
+
+async function handleUnsubscribe(request, env) {
+  if (request.method !== "GET" && request.method !== "POST") {
+    return json({ ok: false, error: "method" }, 405);
+  }
+  const url = new URL(request.url);
+  let token = (url.searchParams.get("token") || "").trim();
+  if (!token && request.method === "POST") {
+    try {
+      const body = await request.json();
+      token = (body.token || "").trim();
+    } catch (e) { token = ""; }
+  }
+  if (!token) return json({ ok: false, error: "token_required" }, 400);
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let key = await env.LICENSES.get("updates-unsub:" + token);
+  let testMode = false;
+  if (!key) {
+    key = await env.LICENSES.get("test:updates-unsub:" + token);
+    testMode = !!key;
+  }
+  if (!key) return json({ ok: false, error: "not_found" }, 404);
+  const storageKey = licenseStorageKey(key, testMode);
+  const lic = await env.LICENSES.get(storageKey, "json");
+  if (!lic) return json({ ok: false, error: "not_found" }, 404);
+  lic.updates_opt_out = true;
+  await env.LICENSES.put(storageKey, JSON.stringify(lic));
+  if (request.method === "GET") {
+    return new Response(
+      "<!doctype html><meta charset=\"utf-8\"><title>Fleetly updates</title>"
+      + "<p>Fleetly update emails are turned off for this license. You can keep using Fleetly.</p>",
+      { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+  return json({ ok: true, updates_opt_out: true });
+}
+
+async function runUpdates(env, options) {
+  const dryRun = options.dryRun !== false;
+  const date = options.date || new Date().toISOString().slice(0, 10);
+  const catalog = await loadUpdateCatalog(env);
+  const keys = options.onlyKey ? [options.onlyKey] : await listLicenseKeys(env);
+  const pending = [];
+  const skipped = [];
+
+  for (const key of keys) {
+    const ending = licenseEnding(key);
+    const found = await loadLicense(env, key);
+    if (!isActiveLicense(found && found.record)) {
+      skipped.push({ license_ending: ending, reason: "inactive" });
+      continue;
+    }
+    const lic = found.record;
+    if (lic.updates_opt_out) {
+      skipped.push({ license_ending: ending, reason: "opt_out" });
+      continue;
+    }
+    const to = (lic.coordinator_email || "").trim();
+    if (!to) {
+      skipped.push({ license_ending: ending, reason: "no_coordinator" });
+      continue;
+    }
+    const sentKey = nsPrefix(found.test) + "updates-sent:" + key;
+    const sent = parseJson(await env.LICENSES.get(sentKey), {});
+    const items = diffForLicense(catalog, sent.versions || {}, lic);
+    if (items.length === 0) {
+      skipped.push({ license_ending: ending, reason: "no_changes" });
+      continue;
+    }
+    pending.push({ key: key, lic: lic, to: to, sent: sent, items: items, test: found.test, sentKey: sentKey });
   }
 
-  return json({ ok: true, ignored: type });
+  if (!dryRun && pending.length && !env.RESEND_API_KEY) {
+    return { ok: false, error: "not_configured", dry_run: false, status: 503 };
+  }
+
+  let updateId = null;
+  if (pending.length) {
+    updateId = dryRun ? await peekUpdateId(env, date) : await reserveUpdateId(env, date);
+  }
+
+  const emails = [];
+  for (const row of pending) {
+    const ending = licenseEnding(row.key);
+    let token = row.lic.updates_unsub_token || "";
+    if (!token && !dryRun) token = await ensureUnsubToken(env, row.key, row.lic, row.test);
+    const unsubscribeUrl = token
+      ? updatesBase(env) + "/api/updates/unsubscribe?token=" + encodeURIComponent(token)
+      : "";
+    let rendered;
+    try {
+      rendered = renderUpdateEmail({
+        updateId: updateId,
+        date: date,
+        licenseKey: row.key,
+        plan: row.lic.plan,
+        items: row.items,
+        unsubscribeUrl: unsubscribeUrl,
+      });
+    } catch (e) {
+      skipped.push({ license_ending: ending, reason: "render_blocked" });
+      continue;
+    }
+    const preview = {
+      to: row.to,
+      subject: rendered.subject,
+      text: rendered.text,
+      html: rendered.html,
+      license_ending: rendered.license_ending,
+      changes: row.items.length,
+      membership_required: row.items.filter(item => item.membership_required).length,
+    };
+    if (dryRun) {
+      preview.dry_run = true;
+      emails.push(preview);
+      continue;
+    }
+    let result;
+    try {
+      result = await sendUpdateEmail(env, row.to, rendered, unsubscribeUrl);
+    } catch (e) {
+      skipped.push({ license_ending: ending, reason: "send_failed" });
+      continue;
+    }
+    if (!result.sent) {
+      skipped.push({ license_ending: ending, reason: "send_failed", status: result.status });
+      continue;
+    }
+    await env.LICENSES.put(row.sentKey, JSON.stringify({
+      update_id: updateId,
+      sent_at: new Date().toISOString(),
+      versions: nextVersionMap(row.sent.versions || {}, row.items),
+    }));
+    preview.dry_run = false;
+    preview.sent = true;
+    emails.push(preview);
+  }
+
+  return {
+    ok: true,
+    dry_run: dryRun,
+    update_id: updateId,
+    date: date,
+    sent: emails.filter(email => email.sent).length,
+    emails: emails,
+    skipped: skipped,
+    catalog_empty: catalog.length === 0,
+  };
+}
+
+async function handleSendUpdates(request, env) {
+  if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body = {};
+  if (request.headers.get("content-length") !== "0") {
+    try { body = await request.json(); } catch (e) { body = {}; }
+  }
+  if (!body || typeof body !== "object") body = {};
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(body.date || "") ? body.date : "";
+  const result = await runUpdates(env, {
+    dryRun: body.dry_run !== false,
+    date: date || undefined,
+    onlyKey: (body.key || "").trim() || undefined,
+  });
+  const status = result.status || (result.ok ? 200 : 503);
+  const payload = Object.assign({}, result);
+  delete payload.status;
+  return json(payload, status);
 }
 
 function json(data, status) {
@@ -850,29 +1470,39 @@ export default {
 
     if (path === "/api/admin/create-key") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
-      const auth = request.headers.get("x-admin-secret") || "";
-      if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-        return json({ ok: false, error: "unauthorized" }, 401);
-      let b;
-      try { b = await request.json(); } catch (e) { b = {}; }
-      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-      const seg = () => Array.from({length: 5}, () => chars[Math.floor(Math.random() * chars.length)]).join("");
-      const key = "FL-" + seg() + "-" + seg();
-      const rec = {
-        email: (b.email || "manual@fleetlybots.com"),
-        status: "active",
-        plan: b.plan || "template",
-        purchased: new Date().toISOString().split("T")[0],
-        created: new Date().toISOString(),
-        note: "manual",
-      };
-      await env.LICENSES.put("license:" + key, JSON.stringify(rec));
-      return json({ ok: true, key: key });
+      return handleCreateKey(request, env);
+    }
+
+    if (path === "/api/admin/lookup") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleLookup(request, env);
+    }
+
+    if (path === "/api/admin/revoke") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleRevoke(request, env);
+    }
+
+    if (path === "/api/admin/rotate-key") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleRotate(request, env);
     }
 
     if (path === "/api/admin/sync-skills") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
       return handleSkillSync(request, env);
+    }
+
+    if (path === "/api/coordinator") {
+      return handleCoordinator(request, env);
+    }
+
+    if (path === "/api/updates/unsubscribe") {
+      return handleUnsubscribe(request, env);
+    }
+
+    if (path === "/api/admin/send-updates") {
+      return handleSendUpdates(request, env);
     }
 
     if (path === "/api/tickets/notify") {
@@ -888,26 +1518,28 @@ export default {
     const m = path.match(/^\/api\/skills\/([a-z0-9-]+)$/);
     if (m) {
       const key = (url.searchParams.get("key") || "").trim();
-      let lic = null;
-      if (key && env.LICENSES) {
-        try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-      }
-      if (!lic || lic.status !== "active") {
-        return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
-      }
-      // New-skill gate: the template includes every skill added in the first
-      // 6 months; skills added later need an active membership. Core skills
-      // never stop working — no brick.
+      const gate = await requireActiveLicense(env, key);
+      if (!gate.ok) return gate.response;
+      const lic = gate.record;
+      // New-skill gate: skills added after purchase + 182 days need an
+      // active membership. The Added date comes from the operator registry.
+      // A skill with no Added date is treated as new (gated), not old.
       const trigger = m[1];
-      const added = SKILL_ADDED[trigger] || "2026-10-08";
-      if (lic.plan !== "membership" && lic.status === "active") {
-        const purchased = lic.purchased || lic.created || "2026-10-09";
-        const cutoff = new Date(new Date(purchased).getTime() + 182 * 86400 * 1000)
-          .toISOString().split("T")[0];
-        if (added > cutoff) {
-          return json({ ok: false, error: "membership_required",
-            message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
-        }
+      let added = "";
+      if (env.LICENSES) {
+        try { added = (await env.LICENSES.get("skill-added:" + trigger)) || ""; } catch (e) { added = ""; }
+      }
+      if (isMembershipGated({
+        type: "skill",
+        action: "add",
+        added: added,
+        plan: lic.plan,
+        previouslyDelivered: false,
+        purchased: lic.purchased,
+        created: lic.created,
+      })) {
+        return json({ ok: false, error: "membership_required",
+          message: "This skill was added after your included update period. Add the Fleetly membership at https://fleetlybots.com/#pricing to unlock it." }, 403);
       }
       // KV-synced skills take priority; hardcoded SKILLS is the fallback.
       let skill = null;
@@ -922,6 +1554,7 @@ export default {
       }
       const resp = { ok: true, trigger: trigger, instructions: skill };
       if (version) resp.version = version;
+      if (gate.test) resp.test = true;
       return json(resp);
     }
 
@@ -929,8 +1562,13 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Every 6 hours. Manual sync: POST /api/admin/sync-kb and /api/admin/sync-skills.
+    // Every 6 hours (wrangler.toml). Pull skills and KB articles into KV.
+    // Update emails are not sent from this job; an admin triggers those
+    // and dry-run is the default. Manual sync: POST /api/admin/sync-kb
+    // and POST /api/admin/sync-skills.
     ctx.waitUntil(syncSkillsFromRegistry(env));
     ctx.waitUntil(syncKBFromNotion(env));
   },
 };
+
+export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN };
