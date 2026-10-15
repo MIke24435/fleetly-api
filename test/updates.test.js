@@ -828,6 +828,69 @@ describe("endpoints", () => {
     assert.equal(await kv.get("kb:33333333"), null);
     assert.equal(contentVersion("", "x").startsWith("h"), true);
   });
+
+  it("requires an active license for the coordinator and keeps test sends in the test namespace", async () => {
+    const kv = memoryKv();
+    const revokedKey = "FL-REVOK-ED99";
+    const testKey = "FL-TESTK-EY99";
+    await kv.put("license:" + revokedKey, JSON.stringify(license({
+      status: "revoked",
+      coordinator_email: "r@example.com",
+    })));
+    await kv.put("test:license:" + testKey, JSON.stringify(license({ test: true })));
+    await kv.put("skill-index", JSON.stringify(["my-tasks"]));
+    await kv.put("skill-record:my-tasks", JSON.stringify({
+      slug: "my-tasks",
+      match: "my tasks:",
+      version: "1.0",
+      added: "2026-10-08",
+      text: "When the user says my tasks: list the open work.",
+      deprecated: false,
+    }));
+    const calls = [];
+    const env = testEnv(kv, {
+      fetch: async (url, init) => {
+        calls.push(JSON.parse(init.body));
+        return new Response("{}", { status: 200 });
+      },
+    });
+
+    const revoked = await post(env, "/api/coordinator", { key: revokedKey, email: "r@example.com" });
+    assert.equal(revoked.status, 403);
+
+    const registered = await post(env, "/api/coordinator", { key: testKey, email: "t@example.com" });
+    assert.equal(registered.status, 200);
+    const registeredBody = await registered.json();
+    assert.deepEqual(registeredBody, { ok: true, test: true });
+    assert.equal(JSON.stringify(registeredBody).includes(testKey), false);
+    const stored = await kv.get("test:license:" + testKey, "json");
+    assert.equal(stored.coordinator_email, "t@example.com");
+    assert.equal(await kv.get("license:" + testKey), null);
+    assert.equal(await kv.get("test:updates-unsub:" + stored.updates_unsub_token), testKey);
+    assert.equal(await kv.get("updates-unsub:" + stored.updates_unsub_token), null);
+
+    const broadcast = await post(env, "/api/admin/send-updates", { dry_run: false, date: "2026-10-15" }, {
+      "x-admin-secret": "s3cret",
+    });
+    const broadcastBody = await broadcast.json();
+    assert.equal(broadcastBody.sent, 0);
+    assert.equal(broadcastBody.skipped.some(row => row.license_ending === "ED99" && row.reason === "inactive"), true);
+    assert.equal(calls.length, 0);
+
+    const targeted = await post(env, "/api/admin/send-updates", {
+      dry_run: false,
+      date: "2026-10-15",
+      key: testKey,
+    }, { "x-admin-secret": "s3cret" });
+    const targetedBody = await targeted.json();
+    assert.equal(targetedBody.sent, 1);
+    assert.equal(targetedBody.emails[0].to, "t@example.com");
+    assert.equal(JSON.stringify(targetedBody).includes(testKey), false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].text.includes(testKey), false);
+    assert.equal(await kv.get("updates-sent:" + testKey), null);
+    assert.ok(await kv.get("test:updates-sent:" + testKey));
+  });
 });
 
 function page(id, properties) {

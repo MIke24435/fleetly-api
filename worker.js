@@ -1,5 +1,21 @@
 // Fleetly License API — serves skill instructions to licensed installs.
 // KV namespace "LICENSES" must be bound. Keys: "license:<KEY>" -> {"email","status","created"}
+// Test-mode Stripe licenses live under "test:license:<KEY>" and never share
+// email, customer, or payment indexes with live keys.
+
+import {
+  adminAuthorized,
+  cancellationHtml,
+  classifyRefund,
+  isActiveLicense,
+  licenseEnding,
+  makeLicenseKey,
+  nextPurchaseDate,
+  ownsTemplateAfterCheckout,
+  publicLicenseView,
+  stripeId,
+  timedEqual,
+} from "./licensing.js";
 
 import {
   MEMBERSHIP_REQUIRED_NOTE,
@@ -10,8 +26,6 @@ import {
   isMembershipGated,
   contentVersion,
   kbFromContentPage,
-  licenseEnding,
-  licenseIsActive,
   makeUnsubToken,
   nextVersionMap,
   renderUpdateEmail,
@@ -43,6 +57,62 @@ const SKILLS = {
 
 const LICENSE_MSG = "This Fleetly install needs a valid license key. Paste your key in the Settings database \u2192 License key field in Notion. No key yet? Get Fleetly at https://fleetlybots.com";
 
+function http(env) {
+  return (env && typeof env.fetch === "function") ? env.fetch : fetch;
+}
+
+function nsPrefix(testMode) {
+  return testMode ? "test:" : "";
+}
+
+function licenseStorageKey(key, testMode) {
+  return nsPrefix(testMode) + "license:" + key;
+}
+
+function parseJson(raw, fallback) {
+  if (raw == null || raw === "") return fallback;
+  try { return JSON.parse(raw); } catch (e) { return fallback; }
+}
+
+async function loadLicense(env, key) {
+  if (!env || !env.LICENSES || !key) return null;
+  try {
+    const live = await env.LICENSES.get("license:" + key, "json");
+    if (live) return { record: live, test: false, storageKey: "license:" + key };
+    const testRec = await env.LICENSES.get("test:license:" + key, "json");
+    if (testRec) return { record: testRec, test: true, storageKey: "test:license:" + key };
+  } catch (e) { return null; }
+  return null;
+}
+
+// One gate for every buyer endpoint: the record must exist and be active.
+// Revoked, refunded, disputed, and deactivated keys all fail it.
+async function requireActiveLicense(env, key) {
+  const found = await loadLicense(env, key);
+  if (!isActiveLicense(found && found.record)) {
+    return { ok: false, response: json({ ok: false, error: "license", message: LICENSE_MSG }, 403) };
+  }
+  return { ok: true, record: found.record, test: found.test, storageKey: found.storageKey };
+}
+
+async function requireAdmin(request, env) {
+  const provided = request.headers.get("x-admin-secret") || "";
+  if (!await adminAuthorized(provided, env && env.ADMIN_SECRET)) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  return null;
+}
+
+async function issueUniqueLicenseKey(env, testMode) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const key = makeLicenseKey();
+    if (!env || !env.LICENSES) return key;
+    const existing = await env.LICENSES.get(licenseStorageKey(key, testMode));
+    if (!existing) return key;
+  }
+  return null;
+}
+
 // ---- Support tickets: buyer files a ticket, row lands in the
 // administrator's Notion "Support Tickets" database ----
 const TICKETS_DB = "488a9ed1-a9a3-48df-bd4f-7101d9786690";
@@ -55,14 +125,9 @@ async function handleTicket(request, env) {
   if (!key || !problem) return json({ ok: false, error: "key_and_problem_required" }, 400);
   if (problem.length > 2000) return json({ ok: false, error: "problem_too_long" }, 400);
 
-  // Validate the license key (any active or honeymoon-expired key may file).
-  let lic = null;
-  if (env.LICENSES) {
-    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-  }
-  if (!lic) return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
-  if (lic.status === "refunded" || lic.status === "disputed")
-    return json({ ok: false, error: "license", message: "This license key was refunded. If you believe this is a mistake, reply to your receipt email." }, 403);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
+  const lic = gate.record;
 
   const today = new Date().toISOString().split("T")[0];
   const title = problem.length > 60 ? problem.slice(0, 57) + "..." : problem;
@@ -79,7 +144,7 @@ async function handleTicket(request, env) {
   // Write the ticket into the administrator's Notion database.
   if (!env.NOTION_TOKEN) return json({ ok: false, error: "tickets_unavailable" }, 503);
   try {
-    const r = await fetch("https://api.notion.com/v1/pages", {
+    const r = await http(env)("https://api.notion.com/v1/pages", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.NOTION_TOKEN,
@@ -106,7 +171,7 @@ async function handleTicket(request, env) {
   // Notify the administrator by email.
   if (env.RESEND_API_KEY) {
     try {
-      await fetch("https://api.resend.com/emails", {
+      await http(env)("https://api.resend.com/emails", {
         method: "POST",
         headers: {
           "Authorization": "Bearer " + env.RESEND_API_KEY,
@@ -333,13 +398,8 @@ async function handleKBSearch(request, env) {
   const key = (url.searchParams.get("key") || "").trim();
   const query = (url.searchParams.get("q") || "").replace(/\+/g, " ").trim().toLowerCase();
   if (!query) return json({ ok: false, error: "query_required" }, 400);
-  // License check (same as skills).
-  let lic = null;
-  if (env.LICENSES && key) {
-    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) {}
-  }
-  if (!lic || lic.status === "refunded" || lic.status === "disputed" || lic.status === "deactivated")
-    return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
 
   let index = [];
   try {
@@ -348,7 +408,11 @@ async function handleKBSearch(request, env) {
   } catch (e) {}
   const STOPWORDS = new Set(["what","when","where","which","who","whom","whose","how","why","is","are","was","were","be","been","being","do","does","did","doing","a","an","the","and","or","but","of","at","by","for","with","about","into","through","during","before","after","above","below","to","from","up","down","in","out","on","off","over","under","again","further","then","once","here","there","all","any","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","so","than","too","very","can","will","just","should","now","it","its","this","that","these","those","i","me","my","we","you","your","he","she","they","them","his","her","their"]);
   const terms = query.split(/\s+/).filter(w => w.length > 2 && !STOPWORDS.has(w));
-  if (terms.length === 0) return json({ ok: true, query: query, results: [] });
+  if (terms.length === 0) {
+    const empty = { ok: true, query: query, results: [] };
+    if (gate.test) empty.test = true;
+    return json(empty);
+  }
   const scored = [];
   for (const entry of index) {
     let score = 0;
@@ -370,13 +434,14 @@ async function handleKBSearch(request, env) {
       }
     } catch (e) {}
   }
-  return json({ ok: true, query: query, results: results });
+  const payload = { ok: true, query: query, results: results };
+  if (gate.test) payload.test = true;
+  return json(payload);
 }
 
 async function handleKBSync(request, env) {
-  const auth = request.headers.get("x-admin-secret") || "";
-  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-    return json({ ok: false, error: "unauthorized" }, 401);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
   return json(await syncKBFromNotion(env));
 }
 
@@ -386,15 +451,6 @@ async function handleKBSync(request, env) {
 // database. The query stays on the id production already uses.
 const REGISTRY_QUERY_DB = "4de82984-9fc8-4ee5-b269-4d5d22398504";
 const REGISTRY_DB_MISMATCH = "4d266c58-4d6d-447f-a72b-0a29d80b3a27";
-
-function http(env) {
-  return (env && env.fetch) || fetch;
-}
-
-function parseJson(raw, fallback) {
-  if (!raw) return fallback;
-  try { return JSON.parse(raw); } catch (e) { return fallback; }
-}
 
 async function queryAllDatabase(env, databaseId) {
   const pages = [];
@@ -469,21 +525,12 @@ async function syncSkillsFromRegistry(env) {
 }
 
 async function handleSkillSync(request, env) {
-  const auth = request.headers.get("x-admin-secret") || "";
-  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-    return json({ ok: false, error: "unauthorized" }, 401);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
   return json(await syncSkillsFromRegistry(env));
 }
 
 // ---- Stripe webhook: automatic license issuance ----
-function makeLicenseKey() {
-  const bytes = crypto.getRandomValues(new Uint8Array(10));
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no confusing chars
-  let s = "";
-  for (const b of bytes) s += alphabet[b % alphabet.length];
-  return "FL-" + s.slice(0, 5) + "-" + s.slice(5);
-}
-
 async function verifyStripeSig(rawBody, sigHeader, secret) {
   if (!sigHeader || !secret) return false;
   const parts = {};
@@ -502,14 +549,8 @@ async function verifyStripeSig(rawBody, sigHeader, secret) {
   const hex = [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, "0")).join("");
   return timedEqual(hex, parts.v1);
 }
-function timedEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let d = 0;
-  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return d === 0;
-}
 
-async function sendKeyEmail(env, email, key, plan, isNew) {
+async function sendKeyEmail(env, email, key, plan, isNew, testMode) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: "no_api_key_or_email" };
   const isMembershipRenewal = plan === "membership" && !isNew;
   const productLine = plan === "membership"
@@ -531,7 +572,7 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
     <p>Questions? Reply to this email.</p>
     <p>— The Fleetly team</p>`;
   try {
-    const r = await fetch("https://api.resend.com/emails", {
+    const r = await http(env)("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Authorization": "Bearer " + env.RESEND_API_KEY,
@@ -540,7 +581,7 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
       body: JSON.stringify({
         from: "Fleetly <hello@fleetlybots.com>",
         to: [email],
-        subject: isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key",
+        subject: (testMode ? "[TEST] " : "") + (isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key"),
         html: html,
       }),
     });
@@ -551,192 +592,420 @@ async function sendKeyEmail(env, email, key, plan, isNew) {
   }
 }
 
-async function handleStripeWebhook(request, env) {
-  const sig = request.headers.get("stripe-signature");
-  const rawBody = await request.text();
-  if (!await verifyStripeSig(rawBody, sig, env.STRIPE_WEBHOOK_SECRET)) {
-    return json({ ok: false, error: "bad_signature" }, 400);
-  }
-  let event;
-  try { event = JSON.parse(rawBody); } catch (e) { return json({ ok: false }, 400); }
+async function claimStripeEvent(env, eventId, testMode) {
+  if (!env.LICENSES || !eventId) return { duplicate: false };
+  const name = nsPrefix(testMode) + "stripe-event:" + eventId;
+  const seen = await env.LICENSES.get(name);
+  if (seen) return { duplicate: true };
+  // Claim before any license write or email so a fast retry cannot send twice.
+  await env.LICENSES.put(name, "processing", { expirationTtl: 86400 * 30 });
+  return { duplicate: false };
+}
 
-  // Idempotency: Stripe retries deliveries; never issue twice for one event.
+async function finishStripeEvent(env, eventId, testMode) {
+  if (!env.LICENSES || !eventId) return;
+  const name = nsPrefix(testMode) + "stripe-event:" + eventId;
+  await env.LICENSES.put(name, "done", { expirationTtl: 86400 * 30 });
+}
+
+async function loadByCustomer(env, customer, testMode) {
+  if (!env.LICENSES || !customer) return null;
+  const key = await env.LICENSES.get(nsPrefix(testMode) + "license-customer:" + customer);
+  if (!key) return null;
+  const storageKey = licenseStorageKey(key, testMode);
+  const record = await env.LICENSES.get(storageKey, "json");
+  if (!record) return null;
+  return { key: key, record: record, storageKey: storageKey, test: !!testMode };
+}
+
+async function sendMembershipEmail(env, email, key, testMode, subject, html) {
+  if (!email || !env.RESEND_API_KEY || !html) return { sent: false };
+  try {
+    const r = await http(env)("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + env.RESEND_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Fleetly <hello@fleetlybots.com>",
+        to: [email],
+        subject: (testMode ? "[TEST] " : "") + subject,
+        html: html,
+      }),
+    });
+    return { sent: !!r.ok };
+  } catch (e) {
+    return { sent: false };
+  }
+}
+
+async function handleCheckoutCompleted(obj, env, testMode) {
+  const email = ((obj.customer_details && obj.customer_details.email) || obj.customer_email || "").trim();
+  const name = (obj.customer_details && obj.customer_details.name) || "";
+  const mode = obj.mode === "subscription" ? "subscription" : "payment";
+  const today = new Date().toISOString().split("T")[0];
+  const prefix = nsPrefix(testMode);
+  let key = "";
+  let record = null;
+  let isNew = false;
+  if (env.LICENSES && email) {
+    key = await env.LICENSES.get(prefix + "license-email:" + email.toLowerCase());
+    if (key) record = await env.LICENSES.get(licenseStorageKey(key, testMode), "json");
+  }
+  if (!record) {
+    key = await issueUniqueLicenseKey(env, testMode);
+    if (!key) return json({ ok: false, error: "key_collision" }, 500);
+    record = {
+      email: email,
+      name: name,
+      status: "active",
+      created: today,
+      purchased: today,
+      stripe_customer: stripeId(obj.customer),
+      test: !!testMode,
+    };
+    isNew = true;
+  }
+  record.email = email || record.email;
+  if (name) record.name = name;
+  if (obj.customer) record.stripe_customer = stripeId(obj.customer);
+  record.test = !!testMode;
+  record.purchased = nextPurchaseDate(record, mode, today, isNew);
+  record.owns_template = ownsTemplateAfterCheckout(record, mode);
+  record.status = "active";
+  record.plan = mode === "subscription" ? "membership" : "template";
+  record.stripe_session = obj.id || "";
+  const paymentIntent = stripeId(obj.payment_intent);
+  const subscriptionId = stripeId(obj.subscription);
+  if (paymentIntent) record.stripe_payment_intent = paymentIntent;
+  if (subscriptionId) record.stripe_subscription = subscriptionId;
   if (env.LICENSES) {
-    const seen = await env.LICENSES.get("stripe-event:" + event.id);
-    if (seen) return json({ ok: true, deduped: true });
+    await env.LICENSES.put(licenseStorageKey(key, testMode), JSON.stringify(record));
+    if (email) await env.LICENSES.put(prefix + "license-email:" + email.toLowerCase(), key);
+    if (record.stripe_customer) {
+      await env.LICENSES.put(prefix + "license-customer:" + record.stripe_customer, key);
+    }
+    const mapping = JSON.stringify({
+      key: key,
+      product: mode === "subscription" ? "membership" : "template",
+    });
+    if (obj.id) await env.LICENSES.put(prefix + "stripe-checkout:" + obj.id, mapping);
+    if (paymentIntent) await env.LICENSES.put(prefix + "stripe-payment:" + paymentIntent, mapping);
+    if (subscriptionId) await env.LICENSES.put(prefix + "stripe-subscription:" + subscriptionId, mapping);
   }
-
-  const type = event.type;
-  const obj = event.data && event.data.object ? event.data.object : {};
-
-  if (type === "checkout.session.completed") {
-    const email = (obj.customer_details && obj.customer_details.email) || obj.customer_email || "";
-    const name = (obj.customer_details && obj.customer_details.name) || "";
-    const mode = obj.mode; // "payment" ($49 template) or "subscription" ($6/mo)
-    const today = new Date().toISOString().split("T")[0];
-    // One key per buyer: look up any existing license by email first.
-    let key = "";
-    let record = null;
-    let isNew = false;
-    if (env.LICENSES && email) {
-      key = await env.LICENSES.get("license-email:" + email.toLowerCase());
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
-    if (!record) {
-      key = makeLicenseKey();
-      record = { email: email, name: name, status: "active", created: today,
-        purchased: today, stripe_customer: obj.customer || "" };
-      isNew = true;
-    }
-    record.email = email || record.email;
-    if (name) record.name = name;
-    if (obj.customer) record.stripe_customer = obj.customer;
-    record.status = "active";
-    if (mode === "subscription") {
-      // Membership: unlocks all skills while subscribed.
-      record.plan = "membership";
-    } else {
-      // Template: new skills free for 6 months from purchase; core skills forever.
-      record.plan = "template";
-      record.purchased = today;
-    }
-    record.stripe_session = obj.id;
-    if (env.LICENSES) {
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
-      await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-      if (email) await env.LICENSES.put("license-email:" + email.toLowerCase(), key);
-      if (record.stripe_customer) await env.LICENSES.put("license-customer:" + record.stripe_customer, key);
-    }
-    // Deliver the key by email (automatic). Key issuance above already
-    // succeeded, so a mail failure never blocks the license itself.
-    const mail = await sendKeyEmail(env, email, key, record.plan, isNew);
-    if (env.LICENSES && !mail.sent) {
-      await env.LICENSES.put("license-email-pending:" + key,
-        JSON.stringify({ email: email, reason: mail.reason }));
-    }
-    return json({ ok: true, issued: true, email_sent: mail.sent });
+  const mail = await sendKeyEmail(env, email, key, record.plan, isNew, testMode);
+  if (env.LICENSES && !mail.sent) {
+    await env.LICENSES.put(prefix + "license-email-pending:" + key,
+      JSON.stringify({ email: email, reason: mail.reason }));
   }
+  return json({ ok: true, issued: true, email_sent: mail.sent, test: !!testMode });
+}
 
-  if (type === "charge.refunded") {
-    // $49 template refunded (or $6 charge refunded): revoke the license.
-    const pi = obj.payment_intent || "";
-    let key = "";
-    let record = null;
-    if (env.LICENSES && pi) {
-      // Find via the charge's receipt email.
-      const email = (obj.receipt_email || "").toLowerCase();
-      if (email) key = await env.LICENSES.get("license-email:" + email);
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
-    if (record) {
-      record.status = "refunded";
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
-    }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    return json({ ok: true, revoked: !!record });
+async function resolveRefundTarget(obj, env, testMode) {
+  const prefix = nsPrefix(testMode);
+  const paymentIntent = stripeId(obj.payment_intent);
+  let mapping = null;
+  if (env.LICENSES && paymentIntent) {
+    mapping = parseJson(await env.LICENSES.get(prefix + "stripe-payment:" + paymentIntent), null);
   }
+  let key = mapping && mapping.key ? mapping.key : "";
+  if (!key && env.LICENSES && obj.customer) {
+    key = await env.LICENSES.get(prefix + "license-customer:" + stripeId(obj.customer)) || "";
+  }
+  return { key: key, mapping: mapping };
+}
 
-  if (type === "charge.dispute.created") {
-    // Chargeback: treat like a refund — revoke the license.
+async function handleChargeRefunded(obj, env, testMode) {
+  const target = await resolveRefundTarget(obj, env, testMode);
+  if (!target.key || !env.LICENSES) return json({ ok: true, revoked: false, reason: "no_mapping" });
+  const storageKey = licenseStorageKey(target.key, testMode);
+  const record = await env.LICENSES.get(storageKey, "json");
+  if (!record) return json({ ok: true, revoked: false, reason: "no_license" });
+  const decision = classifyRefund(obj, target.mapping);
+  if (decision.action === "revoke") {
+    record.status = "revoked";
+    record.revoked_at = new Date().toISOString().split("T")[0];
+    record.revoke_reason = "full refund of template purchase";
+    await env.LICENSES.put(storageKey, JSON.stringify(record));
+    return json({ ok: true, revoked: true, test: !!testMode });
+  }
+  if (decision.action === "drop_membership") {
+    record.plan = "template";
+    if (record.status !== "revoked" && record.status !== "disputed") record.status = "active";
+    await env.LICENSES.put(storageKey, JSON.stringify(record));
+    return json({ ok: true, membership_dropped: true, test: !!testMode });
+  }
+  return json({ ok: true, ignored: decision.reason || "refund" });
+}
+
+async function handleDisputeCreated(obj, env, testMode) {
+  const prefix = nsPrefix(testMode);
+  let key = "";
+  const paymentIntent = stripeId(obj.payment_intent);
+  if (env.LICENSES && paymentIntent) {
+    const mapping = parseJson(await env.LICENSES.get(prefix + "stripe-payment:" + paymentIntent), null);
+    if (mapping && mapping.key) key = mapping.key;
+  }
+  if (!key && env.LICENSES && obj.customer) {
+    key = await env.LICENSES.get(prefix + "license-customer:" + stripeId(obj.customer)) || "";
+  }
+  if (!key && env.LICENSES) {
     const email = (obj.billing_details && obj.billing_details.email || "").toLowerCase();
-    let key = "";
-    let record = null;
-    if (env.LICENSES && email) {
-      key = await env.LICENSES.get("license-email:" + email);
-      if (key) record = await env.LICENSES.get("license:" + key, "json");
-    }
+    if (email) key = await env.LICENSES.get(prefix + "license-email:" + email) || "";
+  }
+  if (key && env.LICENSES) {
+    const storageKey = licenseStorageKey(key, testMode);
+    const record = await env.LICENSES.get(storageKey, "json");
     if (record) {
       record.status = "disputed";
-      await env.LICENSES.put("license:" + key, JSON.stringify(record));
+      await env.LICENSES.put(storageKey, JSON.stringify(record));
+      return json({ ok: true, revoked: true, test: !!testMode });
     }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    return json({ ok: true, revoked: !!record });
   }
+  return json({ ok: true, revoked: false });
+}
 
-  if (type === "customer.subscription.updated" && obj.cancel_at_period_end && obj.status === "active") {
-    // Membership cancelled but runs to period end: confirm immediately.
-    const customer = obj.customer || "";
-    let key = "";
-    let email = "";
-    if (env.LICENSES && customer) {
-      key = await env.LICENSES.get("license-customer:" + customer);
-      if (key) {
-        const rec = await env.LICENSES.get("license:" + key, "json");
-        if (rec) email = rec.email || "";
-      }
-    }
+async function handleSubscriptionUpdated(obj, env, testMode) {
+  const loaded = await loadByCustomer(env, stripeId(obj.customer), testMode);
+  if (obj.cancel_at_period_end && obj.status === "active") {
     const periodEnd = obj.cancel_at
       ? new Date(obj.cancel_at * 1000).toISOString().split("T")[0] : "";
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    if (email && env.RESEND_API_KEY) {
-      try {
-        await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + env.RESEND_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            from: "Fleetly <hello@fleetlybots.com>",
-            to: [email],
-            subject: "Your Fleetly membership is cancelled",
-            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
-              + (periodEnd ? `<p>It stays active through <strong>${periodEnd}</strong>.</p>` : "")
-              + (key ? `<p>Your license key <strong>${key}</strong> keeps working after that: your template and core skills are yours, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
-              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
-              + `<p>— The Fleetly team</p>`,
-          }),
-        });
-      } catch (e) { /* cancellation stands even if the email fails */ }
+    if (loaded && loaded.record.email) {
+      const html = cancellationHtml(loaded.key, [
+        "Your Fleetly membership is cancelled — you won't be charged again.",
+        periodEnd ? "It stays active through <strong>" + periodEnd + "</strong>." : "",
+        "The key keeps working after that: the template and core skills stay, and any refinements to them. Only brand-new skills released after the included period need an active membership.",
+        "Thanks for trying Fleetly. If you ever want back in, you know where to find us.",
+      ].filter(Boolean));
+      await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+        "Your Fleetly membership is cancelled", html);
     }
     return json({ ok: true, cancel_scheduled: true });
   }
-
-  if (type === "customer.subscription.deleted") {
-    // $6/mo cancelled: find the license by customer and deactivate it.
-    const customer = obj.customer || "";
-    let key = "";
-    let email = "";
-    if (env.LICENSES && customer) {
-      key = await env.LICENSES.get("license-customer:" + customer);
-      if (key) {
-        const rec = await env.LICENSES.get("license:" + key, "json");
-        if (rec) {
-          email = rec.email || "";
-          // Back to the template plan: core skills keep working, new skills
-          // gate on the original 6-month window from purchase.
-          rec.plan = "template";
-          rec.status = "active";
-          await env.LICENSES.put("license:" + key, JSON.stringify(rec));
-        }
+  if (loaded && (obj.status === "past_due" || obj.status === "unpaid")) {
+    // Same plan change as cancellation, including buyers who only ever
+    // bought the membership. Whether that honeymoon is right is an owner
+    // pricing decision.
+    if (loaded.record.plan !== "template") {
+      loaded.record.plan = "template";
+      loaded.record.status = "active";
+      await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+      if (loaded.record.email) {
+        const html = cancellationHtml(loaded.key, [
+          "Your Fleetly membership isn't active while the payment is " + String(obj.status).replace(/_/g, " ") + ".",
+          "The template and the skills from your purchase keep working. A membership is only needed for brand-new skills released after the included period.",
+        ]);
+        await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+          "Your Fleetly membership payment needs attention", html);
       }
     }
-    if (env.LICENSES) await env.LICENSES.put("stripe-event:" + event.id, "1", { expirationTtl: 86400 * 30 });
-    // Confirm the cancellation by email so the buyer isn't left wondering.
-    if (email && env.RESEND_API_KEY) {
-      try {
-        await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + env.RESEND_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            from: "Fleetly <hello@fleetlybots.com>",
-            to: [email],
-            subject: "Your Fleetly membership is cancelled",
-            html: `<p>Your Fleetly membership is cancelled — you won't be charged again.</p>`
-              + (key ? `<p>Your license key <strong>${key}</strong> still works: your template and core skills keep working, and any refinements to them. Only brand-new skills released after your included period need an active membership.</p>` : "")
-              + `<p>Thanks for trying Fleetly. If you ever want back in, you know where to find us.</p>`
-              + `<p>— The Fleetly team</p>`,
-          }),
-        });
-      } catch (e) { /* cancellation stands even if the email fails */ }
-    }
-    return json({ ok: true });
+    return json({ ok: true, membership_dropped: true, status: obj.status });
   }
+  if (loaded && (obj.status === "active" || obj.status === "trialing") && loaded.record.plan !== "membership") {
+    loaded.record.plan = "membership";
+    loaded.record.status = "active";
+    await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+    return json({ ok: true, membership_restored: true });
+  }
+  return json({ ok: true, ignored: "subscription.updated" });
+}
 
+async function handleSubscriptionDeleted(obj, env, testMode) {
+  const loaded = await loadByCustomer(env, stripeId(obj.customer), testMode);
+  if (loaded) {
+    loaded.record.plan = "template";
+    loaded.record.status = "active";
+    await env.LICENSES.put(loaded.storageKey, JSON.stringify(loaded.record));
+    if (loaded.record.email) {
+      const html = cancellationHtml(loaded.key, [
+        "Your Fleetly membership is cancelled — you won't be charged again.",
+        "The key still works: the template and core skills keep working, and any refinements to them. Only brand-new skills released after the included period need an active membership.",
+        "Thanks for trying Fleetly. If you ever want back in, you know where to find us.",
+      ]);
+      await sendMembershipEmail(env, loaded.record.email, loaded.key, testMode,
+        "Your Fleetly membership is cancelled", html);
+    }
+  }
+  return json({ ok: true });
+}
+
+async function dispatchStripeEvent(event, env, testMode) {
+  const type = event.type;
+  const obj = event.data && event.data.object ? event.data.object : {};
+  if (type === "checkout.session.completed") return handleCheckoutCompleted(obj, env, testMode);
+  if (type === "charge.refunded") return handleChargeRefunded(obj, env, testMode);
+  if (type === "charge.dispute.created") return handleDisputeCreated(obj, env, testMode);
+  if (type === "customer.subscription.updated") return handleSubscriptionUpdated(obj, env, testMode);
+  if (type === "customer.subscription.deleted") return handleSubscriptionDeleted(obj, env, testMode);
   return json({ ok: true, ignored: type });
+}
+
+async function handleStripeWebhook(request, env) {
+  const sig = request.headers.get("stripe-signature");
+  const rawBody = await request.text();
+  let event;
+  try { event = JSON.parse(rawBody); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const testMode = event.livemode === false;
+  const secret = testMode ? env.STRIPE_WEBHOOK_SECRET_TEST : env.STRIPE_WEBHOOK_SECRET;
+  if (testMode && !secret) return json({ ok: false, error: "test_mode_not_configured" }, 400);
+  if (!await verifyStripeSig(rawBody, sig, secret)) {
+    return json({ ok: false, error: "bad_signature" }, 400);
+  }
+  if (!event.id) return json({ ok: false, error: "missing_event_id" }, 400);
+  const claim = await claimStripeEvent(env, event.id, testMode);
+  if (claim.duplicate) return json({ ok: true, deduped: true });
+  try {
+    return await dispatchStripeEvent(event, env, testMode);
+  } finally {
+    await finishStripeEvent(env, event.id, testMode);
+  }
+}
+
+async function handleCreateKey(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const testMode = body.test === true;
+  const email = String(body.email || "manual@fleetlybots.com").trim();
+  const plan = body.plan === "membership" ? "membership" : "template";
+  const key = await issueUniqueLicenseKey(env, testMode);
+  if (!key) return json({ ok: false, error: "key_collision" }, 500);
+  const today = new Date().toISOString().split("T")[0];
+  const rec = {
+    email: email,
+    name: body.name ? String(body.name).slice(0, 200) : "",
+    status: "active",
+    plan: plan,
+    purchased: today,
+    created: new Date().toISOString(),
+    note: body.note ? String(body.note).slice(0, 500) : "manual",
+    owns_template: plan === "template",
+    test: testMode,
+  };
+  await env.LICENSES.put(licenseStorageKey(key, testMode), JSON.stringify(rec));
+  if (email) {
+    await env.LICENSES.put(nsPrefix(testMode) + "license-email:" + email.toLowerCase(), key);
+  }
+  return json({ ok: true, key: key, test: testMode });
+}
+
+async function handleLookup(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const key = String(body.key || "").trim();
+  if (!key) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, key);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(key) }, 404);
+  try {
+    return json(publicLicenseView(found.record, key, found.test));
+  } catch (e) {
+    return json({ ok: false, error: "redaction_failed", license_ending: licenseEnding(key) }, 500);
+  }
+}
+
+async function handleRevoke(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const key = String(body.key || "").trim();
+  const reason = String(body.reason || "").trim().slice(0, 500);
+  if (!key) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, key);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(key) }, 404);
+  if (!reason && found.record.status !== "revoked") {
+    return json({ ok: false, error: "reason_required" }, 400);
+  }
+  const today = new Date().toISOString().split("T")[0];
+  if (found.record.status !== "revoked") {
+    found.record.status = "revoked";
+    found.record.revoked_at = today;
+    found.record.revoke_reason = reason;
+    await env.LICENSES.put(found.storageKey, JSON.stringify(found.record));
+  }
+  const payload = {
+    ok: true,
+    license_ending: licenseEnding(key),
+    status: "revoked",
+    revoked_at: found.record.revoked_at || "",
+    revoke_reason: found.record.revoke_reason || "",
+    test: found.test,
+  };
+  if (key.length > 4 && JSON.stringify(payload).includes(key)) {
+    return json({ ok: false, error: "redaction_failed" }, 500);
+  }
+  return json(payload);
+}
+
+async function handleRotate(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: "bad_json" }, 400); }
+  const oldKey = String(body.key || "").trim();
+  if (!oldKey) return json({ ok: false, error: "key_required" }, 400);
+  const found = await loadLicense(env, oldKey);
+  if (!found) return json({ ok: false, error: "not_found", license_ending: licenseEnding(oldKey) }, 404);
+  if (found.record.status === "revoked") {
+    return json({ ok: false, error: "revoked", license_ending: licenseEnding(oldKey) }, 409);
+  }
+  const testMode = found.test;
+  const newKey = await issueUniqueLicenseKey(env, testMode);
+  if (!newKey) return json({ ok: false, error: "key_collision" }, 500);
+  const today = new Date().toISOString().split("T")[0];
+  const fresh = {
+    email: found.record.email || "",
+    name: found.record.name || "",
+    status: "active",
+    plan: found.record.plan || "template",
+    purchased: found.record.purchased || today,
+    created: today,
+    stripe_customer: found.record.stripe_customer || "",
+    stripe_subscription: found.record.stripe_subscription || "",
+    stripe_payment_intent: found.record.stripe_payment_intent || "",
+    stripe_session: found.record.stripe_session || "",
+    owns_template: found.record.owns_template === true,
+    note: found.record.note || "",
+    test: testMode,
+    rotated_from_ending: licenseEnding(oldKey),
+  };
+  found.record.status = "deactivated";
+  found.record.deactivated_at = today;
+  found.record.deactivate_reason = "rotated";
+  found.record.rotated_to_ending = licenseEnding(newKey);
+  const prefix = nsPrefix(testMode);
+  await env.LICENSES.put(licenseStorageKey(newKey, testMode), JSON.stringify(fresh));
+  await env.LICENSES.put(found.storageKey, JSON.stringify(found.record));
+  if (fresh.email) await env.LICENSES.put(prefix + "license-email:" + fresh.email.toLowerCase(), newKey);
+  if (fresh.stripe_customer) await env.LICENSES.put(prefix + "license-customer:" + fresh.stripe_customer, newKey);
+  const product = fresh.owns_template ? "template" : "membership";
+  if (fresh.stripe_payment_intent) {
+    await env.LICENSES.put(prefix + "stripe-payment:" + fresh.stripe_payment_intent,
+      JSON.stringify({ key: newKey, product: product }));
+  }
+  if (fresh.stripe_session) {
+    await env.LICENSES.put(prefix + "stripe-checkout:" + fresh.stripe_session,
+      JSON.stringify({ key: newKey, product: product }));
+  }
+  if (fresh.stripe_subscription) {
+    await env.LICENSES.put(prefix + "stripe-subscription:" + fresh.stripe_subscription,
+      JSON.stringify({ key: newKey, product: "membership" }));
+  }
+  const mail = await sendKeyEmail(env, fresh.email, newKey, fresh.plan, true, testMode);
+  return json({
+    ok: true,
+    key: newKey,
+    license_ending: licenseEnding(newKey),
+    previous_ending: licenseEnding(oldKey),
+    email_sent: mail.sent,
+    test: testMode,
+  });
 }
 
 // ---- OTA skill/KB update emails ----
@@ -752,6 +1021,8 @@ function updatesBase(env) {
   return ((env && env.UPDATES_PUBLIC_BASE) || "https://api.fleetlybots.com").replace(/\/$/, "");
 }
 
+// Broadcast walks live licenses only. A test key is included when the
+// admin names it, and loadLicense keeps that record in the test namespace.
 async function listLicenseKeys(env) {
   const keys = [];
   let cursor;
@@ -842,12 +1113,13 @@ async function reserveUpdateId(env, date) {
   return formatUpdateId(date, n);
 }
 
-async function ensureUnsubToken(env, key, lic) {
+async function ensureUnsubToken(env, key, lic, testMode) {
   if (lic.updates_unsub_token) return lic.updates_unsub_token;
   const token = makeUnsubToken();
   lic.updates_unsub_token = token;
-  await env.LICENSES.put("license:" + key, JSON.stringify(lic));
-  await env.LICENSES.put("updates-unsub:" + token, key);
+  const prefix = nsPrefix(!!testMode);
+  await env.LICENSES.put(prefix + "license:" + key, JSON.stringify(lic));
+  await env.LICENSES.put(prefix + "updates-unsub:" + token, key);
   return token;
 }
 
@@ -883,13 +1155,15 @@ async function handleCoordinator(request, env) {
   if (!key || !email) return json({ ok: false, error: "key_and_email_required" }, 400);
   if (!validEmail(email)) return json({ ok: false, error: "bad_email" }, 400);
   if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
-  let lic = null;
-  try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-  if (!licenseIsActive(lic)) return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
+  const gate = await requireActiveLicense(env, key);
+  if (!gate.ok) return gate.response;
+  const lic = gate.record;
   lic.coordinator_email = email;
-  await ensureUnsubToken(env, key, lic);
-  await env.LICENSES.put("license:" + key, JSON.stringify(lic));
-  return json({ ok: true });
+  await ensureUnsubToken(env, key, lic, gate.test);
+  await env.LICENSES.put(gate.storageKey, JSON.stringify(lic));
+  const resp = { ok: true };
+  if (gate.test) resp.test = true;
+  return json(resp);
 }
 
 async function handleUnsubscribe(request, env) {
@@ -906,12 +1180,18 @@ async function handleUnsubscribe(request, env) {
   }
   if (!token) return json({ ok: false, error: "token_required" }, 400);
   if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
-  const key = await env.LICENSES.get("updates-unsub:" + token);
+  let key = await env.LICENSES.get("updates-unsub:" + token);
+  let testMode = false;
+  if (!key) {
+    key = await env.LICENSES.get("test:updates-unsub:" + token);
+    testMode = !!key;
+  }
   if (!key) return json({ ok: false, error: "not_found" }, 404);
-  const lic = await env.LICENSES.get("license:" + key, "json");
+  const storageKey = licenseStorageKey(key, testMode);
+  const lic = await env.LICENSES.get(storageKey, "json");
   if (!lic) return json({ ok: false, error: "not_found" }, 404);
   lic.updates_opt_out = true;
-  await env.LICENSES.put("license:" + key, JSON.stringify(lic));
+  await env.LICENSES.put(storageKey, JSON.stringify(lic));
   if (request.method === "GET") {
     return new Response(
       "<!doctype html><meta charset=\"utf-8\"><title>Fleetly updates</title>"
@@ -931,12 +1211,12 @@ async function runUpdates(env, options) {
 
   for (const key of keys) {
     const ending = licenseEnding(key);
-    let lic = null;
-    try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-    if (!licenseIsActive(lic)) {
+    const found = await loadLicense(env, key);
+    if (!isActiveLicense(found && found.record)) {
       skipped.push({ license_ending: ending, reason: "inactive" });
       continue;
     }
+    const lic = found.record;
     if (lic.updates_opt_out) {
       skipped.push({ license_ending: ending, reason: "opt_out" });
       continue;
@@ -946,13 +1226,14 @@ async function runUpdates(env, options) {
       skipped.push({ license_ending: ending, reason: "no_coordinator" });
       continue;
     }
-    const sent = parseJson(await env.LICENSES.get("updates-sent:" + key), {});
+    const sentKey = nsPrefix(found.test) + "updates-sent:" + key;
+    const sent = parseJson(await env.LICENSES.get(sentKey), {});
     const items = diffForLicense(catalog, sent.versions || {}, lic);
     if (items.length === 0) {
       skipped.push({ license_ending: ending, reason: "no_changes" });
       continue;
     }
-    pending.push({ key: key, lic: lic, to: to, sent: sent, items: items });
+    pending.push({ key: key, lic: lic, to: to, sent: sent, items: items, test: found.test, sentKey: sentKey });
   }
 
   if (!dryRun && pending.length && !env.RESEND_API_KEY) {
@@ -968,7 +1249,7 @@ async function runUpdates(env, options) {
   for (const row of pending) {
     const ending = licenseEnding(row.key);
     let token = row.lic.updates_unsub_token || "";
-    if (!token && !dryRun) token = await ensureUnsubToken(env, row.key, row.lic);
+    if (!token && !dryRun) token = await ensureUnsubToken(env, row.key, row.lic, row.test);
     const unsubscribeUrl = token
       ? updatesBase(env) + "/api/updates/unsubscribe?token=" + encodeURIComponent(token)
       : "";
@@ -1011,7 +1292,7 @@ async function runUpdates(env, options) {
       skipped.push({ license_ending: ending, reason: "send_failed", status: result.status });
       continue;
     }
-    await env.LICENSES.put("updates-sent:" + row.key, JSON.stringify({
+    await env.LICENSES.put(row.sentKey, JSON.stringify({
       update_id: updateId,
       sent_at: new Date().toISOString(),
       versions: nextVersionMap(row.sent.versions || {}, row.items),
@@ -1035,9 +1316,8 @@ async function runUpdates(env, options) {
 
 async function handleSendUpdates(request, env) {
   if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
-  const auth = request.headers.get("x-admin-secret") || "";
-  if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-    return json({ ok: false, error: "unauthorized" }, 401);
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
   if (!env.LICENSES) return json({ ok: false, error: "not_configured" }, 503);
   let body = {};
   if (request.headers.get("content-length") !== "0") {
@@ -1097,24 +1377,22 @@ export default {
 
     if (path === "/api/admin/create-key") {
       if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
-      const auth = request.headers.get("x-admin-secret") || "";
-      if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET)
-        return json({ ok: false, error: "unauthorized" }, 401);
-      let b;
-      try { b = await request.json(); } catch (e) { b = {}; }
-      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-      const seg = () => Array.from({length: 5}, () => chars[Math.floor(Math.random() * chars.length)]).join("");
-      const key = "FL-" + seg() + "-" + seg();
-      const rec = {
-        email: (b.email || "manual@fleetlybots.com"),
-        status: "active",
-        plan: b.plan || "template",
-        purchased: new Date().toISOString().split("T")[0],
-        created: new Date().toISOString(),
-        note: "manual",
-      };
-      await env.LICENSES.put("license:" + key, JSON.stringify(rec));
-      return json({ ok: true, key: key });
+      return handleCreateKey(request, env);
+    }
+
+    if (path === "/api/admin/lookup") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleLookup(request, env);
+    }
+
+    if (path === "/api/admin/revoke") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleRevoke(request, env);
+    }
+
+    if (path === "/api/admin/rotate-key") {
+      if (request.method !== "POST") return json({ ok: false, error: "method" }, 405);
+      return handleRotate(request, env);
     }
 
     if (path === "/api/admin/sync-skills") {
@@ -1147,13 +1425,9 @@ export default {
     const m = path.match(/^\/api\/skills\/([a-z0-9-]+)$/);
     if (m) {
       const key = (url.searchParams.get("key") || "").trim();
-      let lic = null;
-      if (key && env.LICENSES) {
-        try { lic = await env.LICENSES.get("license:" + key, "json"); } catch (e) { lic = null; }
-      }
-      if (!lic || lic.status !== "active") {
-        return json({ ok: false, error: "license", message: LICENSE_MSG }, 403);
-      }
+      const gate = await requireActiveLicense(env, key);
+      if (!gate.ok) return gate.response;
+      const lic = gate.record;
       // New-skill gate: skills added after purchase + 182 days need an
       // active membership. The Added date comes from the operator registry.
       // A skill with no Added date is treated as new (gated), not old.
@@ -1187,6 +1461,7 @@ export default {
       }
       const resp = { ok: true, trigger: trigger, instructions: skill };
       if (version) resp.version = version;
+      if (gate.test) resp.test = true;
       return json(resp);
     }
 
