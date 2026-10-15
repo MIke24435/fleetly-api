@@ -36,6 +36,9 @@ function memoryKv() {
     async put(key, value) {
       store.set(key, String(value));
     },
+    async delete(key) {
+      store.delete(key);
+    },
     async list({ prefix } = {}) {
       const keys = [...store.keys()]
         .filter(name => name.startsWith(prefix || ""))
@@ -232,6 +235,7 @@ describe("draft exclusion", () => {
       },
     });
     assert.equal(published.skip, false);
+    assert.equal(published.id, "aaaaaaaabbbbccccddddeeeeeeeeeeee");
     assert.equal(published.title, "Reset a license");
     assert.equal(published.version, "3");
 
@@ -822,11 +826,161 @@ describe("endpoints", () => {
     assert.equal(body.synced, 2);
     const index = JSON.parse(await kv.get("kb:index"));
     assert.deepEqual(index.map(row => row.title), ["Reset a license", "Template article"]);
-    const article = JSON.parse(await kv.get("kb:11111111"));
+    assert.deepEqual(index.map(row => row.id), [
+      "11111111111111111111111111111111",
+      "44444444444444444444444444444444",
+    ]);
+    const article = JSON.parse(await kv.get("kb:11111111111111111111111111111111"));
+    assert.equal(article.id, "11111111111111111111111111111111");
     assert.equal(article.version, "3");
-    assert.equal(await kv.get("kb:22222222"), null);
-    assert.equal(await kv.get("kb:33333333"), null);
+    assert.equal(await kv.get("kb:11111111"), null);
+    assert.equal(await kv.get("kb:22222222222222222222222222222222"), null);
+    assert.equal(await kv.get("kb:33333333333333333333333333333333"), null);
     assert.equal(contentVersion("", "x").startsWith("h"), true);
+  });
+
+  it("stores both articles when their page ids share an 8-character prefix", async () => {
+    const kv = memoryKv();
+    let puts = 0;
+    const orig = kv.put.bind(kv);
+    kv.put = async (key, value) => { puts++; return orig(key, value); };
+    const alphaId = "3f45be5f-1111-1111-1111-111111111111".replace(/-/g, "");
+    const betaId = "3f45be5f-2222-2222-2222-222222222222".replace(/-/g, "");
+    await orig("kb:3f45be5f", JSON.stringify({ id: "3f45be5f", title: "Collided", body: "one body" }));
+    await orig("kb:index", JSON.stringify([{ id: "3f45be5f", title: "Collided", keywords: "collided" }]));
+    await orig("kb-catalog", JSON.stringify(["3f45be5f"]));
+    const env = testEnv(kv, {
+      fetch: async () => new Response(JSON.stringify({
+        results: [
+          page("3f45be5f-1111-1111-1111-111111111111", {
+            Title: title("Alpha article"),
+            Body: rich("Alpha body stays distinct from the other article."),
+            Status: { select: { name: "Published" } },
+            Keywords: rich("alpha"),
+          }),
+          page("3f45be5f-2222-2222-2222-222222222222", {
+            Title: title("Beta article"),
+            Body: rich("Beta body stays distinct from the other article."),
+            Status: { select: { name: "Published" } },
+            Keywords: rich("beta"),
+          }),
+        ],
+        has_more: false,
+      }), { status: 200 }),
+    });
+    const first = await (await post(env, "/api/admin/sync-kb", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(first.synced, 2);
+    assert.equal(first.deleted, 1);
+    const alpha = JSON.parse(await kv.get("kb:" + alphaId));
+    const beta = JSON.parse(await kv.get("kb:" + betaId));
+    assert.equal(alpha.title, "Alpha article");
+    assert.equal(beta.title, "Beta article");
+    assert.notEqual(alpha.body, beta.body);
+    assert.equal(await kv.get("kb:3f45be5f"), null);
+    assert.deepEqual(JSON.parse(await kv.get("kb:index")).map(row => row.id), [alphaId, betaId]);
+    // The migration records the old id as deprecated, so the following sync
+    // clears that list. The sync after that writes nothing.
+    await post(env, "/api/admin/sync-kb", {}, { "x-admin-secret": "s3cret" });
+    puts = 0;
+    const settled = await (await post(env, "/api/admin/sync-kb", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(settled.puts, 0);
+    assert.equal(puts, 0);
+    assert.equal((await kv.get("kb:" + alphaId, "json")).body, alpha.body);
+    assert.equal((await kv.get("kb:" + betaId, "json")).body, beta.body);
+  });
+
+  it("keeps Added dates when a skill sync is unchanged or reshuffled", async () => {
+    const kv = memoryKv();
+    let puts = 0;
+    const orig = kv.put.bind(kv);
+    kv.put = async (key, value) => { puts++; return orig(key, value); };
+    await orig("skill:my-tasks", "When the user says my tasks: this is the previous instruction text.");
+    await orig("skill-version:my-tasks", "1.0");
+    let flip = false;
+    const rows = {
+      "my-tasks": {
+        properties: {
+          Skill: title("My Tasks"),
+          Trigger: rich("my tasks:"),
+          Instructions: rich("When the user says my tasks: list every open task for the user today."),
+          Added: { date: { start: "2026-10-08" } },
+          Version: rich("1.3"),
+          "Applies to": rich("user"),
+        },
+      },
+      clean: {
+        properties: {
+          Skill: title("Clean"),
+          Trigger: rich("clean:"),
+          Instructions: rich("When the user says clean: remove the sample rows from the queue."),
+          Version: rich("1.0"),
+        },
+      },
+    };
+    const env = testEnv(kv, {
+      fetch: async () => {
+        const order = flip ? [rows.clean, rows["my-tasks"]] : [rows["my-tasks"], rows.clean];
+        return new Response(JSON.stringify({ results: order, has_more: false }), { status: 200 });
+      },
+    });
+    const first = await (await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(first.synced, 2);
+    assert.equal(await kv.get("skill-added:my-tasks"), "2026-10-08");
+    assert.equal(await kv.get("skill-added:clean"), "");
+    assert.deepEqual(JSON.parse(await kv.get("skill-index")), ["my-tasks", "clean"]);
+    const history = [...kv.store.keys()].filter(key => key.startsWith("skill-history:my-tasks:"));
+    assert.equal(history.length, 1);
+    flip = true;
+    puts = 0;
+    const second = await (await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(second.puts, 0);
+    assert.equal(puts, 0);
+    assert.equal(await kv.get("skill-added:my-tasks"), "2026-10-08");
+    assert.equal(await kv.get("skill-added:clean"), "");
+    assert.deepEqual(JSON.parse(await kv.get("skill-index")), ["my-tasks", "clean"]);
+    assert.equal(await kv.get(history[0]), "When the user says my tasks: this is the previous instruction text.");
+    assert.equal(JSON.parse(await kv.get("skill-record:my-tasks")).added, "2026-10-08");
+  });
+
+  it("marks a removed skill deprecated and keeps its Added date", async () => {
+    const kv = memoryKv();
+    let dropClean = false;
+    const rows = [
+      {
+        properties: {
+          Skill: title("My Tasks"),
+          Trigger: rich("my tasks:"),
+          Instructions: rich("When the user says my tasks: list every open task for the user today."),
+          Added: { date: { start: "2026-10-08" } },
+          Version: rich("1.3"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("Clean"),
+          Trigger: rich("clean:"),
+          Instructions: rich("When the user says clean: remove the sample rows from the queue."),
+          Added: { date: { start: "2026-11-01" } },
+          Version: rich("1.0"),
+        },
+      },
+    ];
+    const env = testEnv(kv, {
+      fetch: async () => new Response(JSON.stringify({
+        results: dropClean ? [rows[0]] : rows,
+        has_more: false,
+      }), { status: 200 }),
+    });
+    await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" });
+    dropClean = true;
+    const body = await (await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(body.synced, 1);
+    assert.equal(body.deprecated, 1);
+    assert.deepEqual(JSON.parse(await kv.get("skill-index")), ["my-tasks"]);
+    assert.deepEqual(JSON.parse(await kv.get("skill-deprecated")), ["clean"]);
+    assert.equal(await kv.get("skill-added:clean"), "2026-11-01");
+    assert.equal(JSON.parse(await kv.get("skill-record:clean")).deprecated, true);
+    assert.ok(await kv.get("skill:clean"));
   });
 
   it("requires an active license for the coordinator and keeps test sends in the test namespace", async () => {

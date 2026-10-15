@@ -358,6 +358,37 @@ async function handleWaitlist(request, env) {
 // ---- KB search: query published knowledge base articles ----
 const CONTENT_DB = "00942471-34fa-49fe-af64-ea9356313b7f";
 const CONTENT_PAGE = "9ac7f508a8144300b7a967946fd7b41f";
+
+// Free-plan KV allows 1,000 puts/day. Reads are cheap, so skip a put when the
+// stored string is already the value we would write.
+async function putIfChanged(kv, key, value) {
+  let prev = null;
+  try { prev = await kv.get(key); } catch (e) { prev = null; }
+  if (prev === value) return false;
+  await kv.put(key, value);
+  return true;
+}
+
+// Deletes count against their own daily quota, so only delete a key that exists.
+async function deleteIfPresent(kv, key) {
+  let prev = null;
+  try { prev = await kv.get(key); } catch (e) { prev = null; }
+  if (prev == null) return false;
+  await kv.delete(key);
+  return true;
+}
+
+function idsFromIndex(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(e => (e && typeof e === "object" ? e.id : e)).filter(id => typeof id === "string" && id);
+  } catch (e) {
+    return [];
+  }
+}
+
 async function syncKBFromNotion(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
   // No server-side Status filter: the operator KB uses Status = Published,
@@ -367,8 +398,11 @@ async function syncKBFromNotion(env) {
   if (!fetched.ok) return fetched;
   const prevCatalog = parseJson(await env.LICENSES.get("kb-catalog"), []);
   let synced = 0;
+  let puts = 0;
+  let deleted = 0;
   const index = [];
   const seen = [];
+  const seenSet = new Set();
   for (const page of fetched.pages) {
     const article = kbFromContentPage(page);
     if (article.skip) continue;
@@ -376,21 +410,43 @@ async function syncKBFromNotion(env) {
       id: article.id, title: article.title, type: article.type,
       body: article.body, keywords: article.keywords, version: article.version,
     };
-    await env.LICENSES.put("kb:" + article.id, JSON.stringify(stored));
-    index.push({
-      id: article.id,
-      title: article.title,
-      keywords: article.keywords + " " + article.title.toLowerCase(),
-    });
-    if (!seen.includes(article.id)) seen.push(article.id);
+    if (await putIfChanged(env.LICENSES, "kb:" + article.id, JSON.stringify(stored))) puts++;
+    if (!seenSet.has(article.id)) {
+      seenSet.add(article.id);
+      seen.push(article.id);
+      index.push({
+        id: article.id,
+        title: article.title,
+        keywords: article.keywords + " " + article.title.toLowerCase(),
+      });
+    }
     synced++;
   }
-  const deprecated = prevCatalog.filter(id => !seen.includes(id));
-  await env.LICENSES.put("kb:index", JSON.stringify(index));
-  await env.LICENSES.put("kb-catalog", JSON.stringify(seen));
-  await env.LICENSES.put("kb-deprecated", JSON.stringify(deprecated));
-  await env.LICENSES.put("kb-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced, deprecated: deprecated.length };
+  // Stable order so a reshuffle from Notion does not rewrite the index.
+  index.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const catalog = seen.slice().sort();
+  const prevIds = Array.isArray(prevCatalog) ? prevCatalog.filter(id => typeof id === "string" && id) : [];
+  const deprecated = prevIds.filter(id => !seenSet.has(id)).sort();
+  const indexJson = JSON.stringify(index);
+  const prevIndex = await env.LICENSES.get("kb:index");
+  if (prevIndex !== indexJson) {
+    for (const oldId of idsFromIndex(prevIndex)) {
+      if (seenSet.has(oldId)) continue;
+      // Full page ids stay on disk so a retire notice can still read the
+      // title. Shorter ids are the pre-fix collision keys.
+      if (oldId.length === 32) continue;
+      if (await deleteIfPresent(env.LICENSES, "kb:" + oldId)) deleted++;
+    }
+    await env.LICENSES.put("kb:index", indexJson);
+    puts++;
+  }
+  if (await putIfChanged(env.LICENSES, "kb-catalog", JSON.stringify(catalog))) puts++;
+  if (await putIfChanged(env.LICENSES, "kb-deprecated", JSON.stringify(deprecated))) puts++;
+  if (puts > 0 || deleted > 0) {
+    await env.LICENSES.put("kb-sync:last", new Date().toISOString());
+    puts++;
+  }
+  return { ok: true, synced: synced, deprecated: deprecated.length, puts: puts, deleted: deleted };
 }
 
 async function handleKBSearch(request, env) {
@@ -446,7 +502,7 @@ async function handleKBSync(request, env) {
 }
 
 // ---- Skill sync: pull from the administrator's Notion registry into KV ----
-// The hourly sync has always queried REGISTRY_QUERY_DB. REGISTRY_DB_MISMATCH
+// The scheduled sync has always queried REGISTRY_QUERY_DB. REGISTRY_DB_MISMATCH
 // was declared beside it and never passed to Notion. They are not the same
 // database. The query stays on the id production already uses.
 const REGISTRY_QUERY_DB = "4de82984-9fc8-4ee5-b269-4d5d22398504";
@@ -476,13 +532,30 @@ async function queryAllDatabase(env, databaseId) {
   return { ok: true, pages: pages };
 }
 
+function sameStringSet(left, right) {
+  if (left.length !== right.length) return false;
+  const set = new Set(right);
+  for (const item of left) {
+    if (!set.has(item)) return false;
+  }
+  return true;
+}
+
+function stringList(raw) {
+  const parsed = parseJson(raw, []);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter(item => typeof item === "string" && item);
+}
+
 async function syncSkillsFromRegistry(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
   const fetched = await queryAllDatabase(env, REGISTRY_QUERY_DB);
   if (!fetched.ok) return fetched;
-  const prevIndex = parseJson(await env.LICENSES.get("skill-index"), []);
+  const prevSlugs = stringList(await env.LICENSES.get("skill-index"));
   const seen = [];
+  const seenSet = new Set();
   let synced = 0;
+  let puts = 0;
   for (const page of fetched.pages) {
     const row = skillFromRegistryPage(page.properties || {});
     if (row.skip) continue;
@@ -493,35 +566,55 @@ async function syncSkillsFromRegistry(env) {
       await env.LICENSES.put(
         "skill-history:" + row.slug + ":" + stamp + ":" + (prevVer || "unversioned"),
         prev);
+      puts++;
     }
-    await env.LICENSES.put("skill:" + row.slug, row.text);
-    if (row.explicitVersion) await env.LICENSES.put("skill-version:" + row.slug, row.explicitVersion);
-    if (row.updated) await env.LICENSES.put("skill-updated:" + row.slug, row.updated);
+    if (await putIfChanged(env.LICENSES, "skill:" + row.slug, row.text)) puts++;
+    if (row.explicitVersion) {
+      if (await putIfChanged(env.LICENSES, "skill-version:" + row.slug, row.explicitVersion)) puts++;
+    }
+    if (row.updated) {
+      if (await putIfChanged(env.LICENSES, "skill-updated:" + row.slug, row.updated)) puts++;
+    }
     // Empty string when the registry row has no Added date. The gate treats
-    // that as new. Missing key (never synced) is the same fail-safe.
-    await env.LICENSES.put("skill-added:" + row.slug, row.added || "");
-    await env.LICENSES.put("skill-record:" + row.slug, JSON.stringify({
+    // that as new. A missing key (never synced) is the same fail-safe.
+    if (await putIfChanged(env.LICENSES, "skill-added:" + row.slug, row.added || "")) puts++;
+    const record = {
       slug: row.slug,
       match: row.match,
       version: row.version,
       added: row.added || "",
       text: row.text,
       deprecated: false,
-    }));
-    if (!seen.includes(row.slug)) seen.push(row.slug);
+    };
+    if (await putIfChanged(env.LICENSES, "skill-record:" + row.slug, JSON.stringify(record))) puts++;
+    if (!seenSet.has(row.slug)) {
+      seenSet.add(row.slug);
+      seen.push(row.slug);
+    }
     synced++;
   }
-  const deprecated = prevIndex.filter(slug => !seen.includes(slug));
+  const deprecated = prevSlugs.filter(slug => !seenSet.has(slug));
   for (const slug of deprecated) {
     const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
-    if (!rec) continue;
+    if (!rec || rec.deprecated === true) continue;
     rec.deprecated = true;
-    await env.LICENSES.put("skill-record:" + slug, JSON.stringify(rec));
+    if (await putIfChanged(env.LICENSES, "skill-record:" + slug, JSON.stringify(rec))) puts++;
   }
-  await env.LICENSES.put("skill-index", JSON.stringify(seen));
-  await env.LICENSES.put("skill-deprecated", JSON.stringify(deprecated));
-  await env.LICENSES.put("skill-sync:last", new Date().toISOString());
-  return { ok: true, synced: synced, deprecated: deprecated.length };
+  // Keep the stored slug order when the set is unchanged, so a Notion
+  // reshuffle does not spend a put. skill-history keys are never deleted.
+  if (!sameStringSet(prevSlugs, seen)) {
+    await env.LICENSES.put("skill-index", JSON.stringify(seen));
+    puts++;
+  }
+  if (!sameStringSet(stringList(await env.LICENSES.get("skill-deprecated")), deprecated)) {
+    await env.LICENSES.put("skill-deprecated", JSON.stringify(deprecated));
+    puts++;
+  }
+  if (puts > 0) {
+    await env.LICENSES.put("skill-sync:last", new Date().toISOString());
+    puts++;
+  }
+  return { ok: true, synced: synced, deprecated: deprecated.length, puts: puts };
 }
 
 async function handleSkillSync(request, env) {
@@ -1011,7 +1104,7 @@ async function handleRotate(request, env) {
 // ---- OTA skill/KB update emails ----
 // Buyers register a Coordinator inbox. An admin run (dry-run by default)
 // emails that inbox the rows that changed since the license's last send.
-// The hourly sync does not send mail.
+// The scheduled sync does not send mail.
 
 function updatesFrom(env) {
   return (env && env.UPDATES_FROM) || UPDATES_FROM;
@@ -1469,8 +1562,10 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // Hourly: pull fresh skills and KB articles. Update emails are not
-    // sent from this job; an admin triggers those and dry-run is the default.
+    // Every 6 hours (wrangler.toml). Pull skills and KB articles into KV.
+    // Update emails are not sent from this job; an admin triggers those
+    // and dry-run is the default. Manual sync: POST /api/admin/sync-kb
+    // and POST /api/admin/sync-skills.
     ctx.waitUntil(syncSkillsFromRegistry(env));
     ctx.waitUntil(syncKBFromNotion(env));
   },

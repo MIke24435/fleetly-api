@@ -198,9 +198,11 @@ export function kbFromContentPage(page) {
   const body = notionPlainText(props.Body).trim();
   if (!title || !body) return { skip: true, reason: "incomplete" };
   const explicitVersion = notionPlainText(props.Version).trim();
+  // Full dash-stripped Notion page id. Published articles share the first
+  // 8 hex chars, so a truncated key overwrites another article.
   return {
     skip: false,
-    id: String(page.id || "").replace(/-/g, "").slice(0, 8),
+    id: String(page.id || "").replace(/-/g, ""),
     title: title,
     type: statusName(props.Type) || notionPlainText(props.Type).trim(),
     body: body,
