@@ -28,6 +28,7 @@ import {
   kbFromContentPage,
   makeUnsubToken,
   nextVersionMap,
+  preservedAddedDate,
   renderUpdateEmail,
   skillFromRegistryPage,
   validEmail,
@@ -547,6 +548,45 @@ function stringList(raw) {
   return parsed.filter(item => typeof item === "string" && item);
 }
 
+const STALE_KB_KEYS = ["kb:kb001", "kb:kb002", "kb:kb003"];
+
+function validSkillSlug(slug) {
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug);
+}
+
+async function listByPrefix(kv, prefix) {
+  if (!kv || typeof kv.list !== "function") return null;
+  const names = [];
+  let cursor;
+  try {
+    do {
+      const page = await kv.list({ prefix: prefix, cursor: cursor, limit: 1000 });
+      for (const entry of page.keys || []) {
+        if (entry && entry.name) names.push(entry.name);
+      }
+      cursor = page.list_complete === false ? page.cursor : undefined;
+    } while (cursor);
+  } catch (e) {
+    return null;
+  }
+  return names;
+}
+
+async function deleteSkillSlug(kv, slug) {
+  let deleted = 0;
+  const keys = [
+    "skill:" + slug,
+    "skill-version:" + slug,
+    "skill-updated:" + slug,
+    "skill-added:" + slug,
+    "skill-record:" + slug,
+  ];
+  for (const key of keys) {
+    if (await deleteIfPresent(kv, key)) deleted++;
+  }
+  return deleted;
+}
+
 async function syncSkillsFromRegistry(env) {
   if (!env.NOTION_TOKEN || !env.LICENSES) return { ok: false, error: "not_configured" };
   const fetched = await queryAllDatabase(env, REGISTRY_QUERY_DB);
@@ -554,19 +594,52 @@ async function syncSkillsFromRegistry(env) {
   const prevSlugs = stringList(await env.LICENSES.get("skill-index"));
   const seen = [];
   const seenSet = new Set();
+  const legacySlugs = [];
+  const migrations = [];
+  const collisions = [];
   let synced = 0;
   let puts = 0;
+  let deleted = 0;
+  const bySlug = new Map();
   for (const page of fetched.pages) {
     const row = skillFromRegistryPage(page.properties || {});
     if (row.skip) continue;
+    if (!bySlug.has(row.slug)) bySlug.set(row.slug, []);
+    bySlug.get(row.slug).push(row);
+  }
+  const winners = [];
+  for (const [slug, group] of bySlug) {
+    const ordered = group.slice().sort((a, b) => {
+      const an = a.name || a.match || slug;
+      const bn = b.name || b.match || slug;
+      if (an < bn) return -1;
+      if (an > bn) return 1;
+      return String(a.match || "").localeCompare(String(b.match || ""));
+    });
+    winners.push(ordered[0]);
+    const kept = ordered[0].name || ordered[0].match || slug;
+    for (const skippedRow of ordered.slice(1)) {
+      const skipped = skippedRow.name || skippedRow.match || slug;
+      console.warn("skill slug collision: \"" + slug + "\" kept \"" + kept + "\", skipped \"" + skipped + "\"");
+      collisions.push({ slug: slug, kept: kept, skipped: skipped });
+    }
+  }
+  for (const row of winners) {
+    let added = row.added || "";
+    if (row.legacySlug && row.legacySlug !== row.slug) {
+      const legacyAdded = await env.LICENSES.get("skill-added:" + row.legacySlug);
+      const currentAdded = await env.LICENSES.get("skill-added:" + row.slug);
+      const legacyBody = await env.LICENSES.get("skill:" + row.legacySlug);
+      added = preservedAddedDate(row.added, legacyAdded, currentAdded, legacyBody != null);
+      if (legacyBody != null) migrations.push({ from: row.legacySlug, to: row.slug });
+      legacySlugs.push(row.legacySlug);
+    }
     const prev = await env.LICENSES.get("skill:" + row.slug);
     const prevVer = await env.LICENSES.get("skill-version:" + row.slug);
     if (prev && prev !== row.text) {
       const stamp = new Date().toISOString().split("T")[0];
-      await env.LICENSES.put(
-        "skill-history:" + row.slug + ":" + stamp + ":" + (prevVer || "unversioned"),
-        prev);
-      puts++;
+      const historyKey = "skill-history:" + row.slug + ":" + stamp + ":" + (prevVer || "unversioned");
+      if (await putIfChanged(env.LICENSES, historyKey, prev)) puts++;
     }
     if (await putIfChanged(env.LICENSES, "skill:" + row.slug, row.text)) puts++;
     if (row.explicitVersion) {
@@ -575,14 +648,15 @@ async function syncSkillsFromRegistry(env) {
     if (row.updated) {
       if (await putIfChanged(env.LICENSES, "skill-updated:" + row.slug, row.updated)) puts++;
     }
-    // Empty string when the registry row has no Added date. The gate treats
-    // that as new. A missing key (never synced) is the same fail-safe.
-    if (await putIfChanged(env.LICENSES, "skill-added:" + row.slug, row.added || "")) puts++;
+    // Empty string when the registry row has no Added date and there is no
+    // prior key to migrate. The gate treats that as new. A missing key
+    // (never synced) is the same fail-safe. A moved skill keeps its old date.
+    if (await putIfChanged(env.LICENSES, "skill-added:" + row.slug, added)) puts++;
     const record = {
       slug: row.slug,
       match: row.match,
       version: row.version,
-      added: row.added || "",
+      added: added,
       text: row.text,
       deprecated: false,
     };
@@ -593,7 +667,31 @@ async function syncSkillsFromRegistry(env) {
     }
     synced++;
   }
-  const deprecated = prevSlugs.filter(slug => !seenSet.has(slug));
+  const stale = new Set();
+  if (!seenSet.has("retired")) stale.add("retired");
+  for (const slug of legacySlugs) {
+    if (slug && !seenSet.has(slug)) stale.add(slug);
+  }
+  for (const slug of prevSlugs) {
+    if (seenSet.has(slug)) continue;
+    if (slug === "retired" || !validSkillSlug(slug)) stale.add(slug);
+  }
+  const listed = await listByPrefix(env.LICENSES, "skill:");
+  if (listed) {
+    for (const key of listed) {
+      if (!key.startsWith("skill:")) continue;
+      const slug = key.slice("skill:".length);
+      if (!slug || seenSet.has(slug)) continue;
+      if (slug === "retired" || !validSkillSlug(slug)) stale.add(slug);
+    }
+  }
+  for (const slug of stale) {
+    deleted += await deleteSkillSlug(env.LICENSES, slug);
+  }
+  for (const key of STALE_KB_KEYS) {
+    if (await deleteIfPresent(env.LICENSES, key)) deleted++;
+  }
+  const deprecated = prevSlugs.filter(slug => !seenSet.has(slug) && !stale.has(slug));
   for (const slug of deprecated) {
     const rec = parseJson(await env.LICENSES.get("skill-record:" + slug), null);
     if (!rec || rec.deprecated === true) continue;
@@ -610,11 +708,19 @@ async function syncSkillsFromRegistry(env) {
     await env.LICENSES.put("skill-deprecated", JSON.stringify(deprecated));
     puts++;
   }
-  if (puts > 0) {
+  if (puts > 0 || deleted > 0) {
     await env.LICENSES.put("skill-sync:last", new Date().toISOString());
     puts++;
   }
-  return { ok: true, synced: synced, deprecated: deprecated.length, puts: puts };
+  return {
+    ok: true,
+    synced: synced,
+    deprecated: deprecated.length,
+    puts: puts,
+    deleted: deleted,
+    collisions: collisions,
+    migrations: migrations,
+  };
 }
 
 async function handleSkillSync(request, env) {

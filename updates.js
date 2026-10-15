@@ -84,8 +84,49 @@ export function isMembershipGated(input) {
   return added > entitlementCutoff(purchased);
 }
 
-export function triggerToSlug(raw) {
+// Previous sync stored the whole trigger, so "archive: <numbers>" became
+// "archive:-<numbers>" and never matched /api/skills/<slug>.
+export function legacyTriggerToSlug(raw) {
   return String(raw || "").trim().replace(/:$/, "").replace(/\s+/g, "-").toLowerCase();
+}
+
+export function sanitizeSlug(raw) {
+  return String(raw || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// Command words only. Cut at the first ":", "<", "(", or "|", then keep
+// [a-z0-9-]. "archive: <number>" and "automatic (logit:)" both stay one word.
+export function triggerToSlug(raw) {
+  let text = String(raw || "").toLowerCase();
+  const cut = text.search(/[:<(|]/);
+  if (cut >= 0) text = text.slice(0, cut);
+  return sanitizeSlug(text);
+}
+
+export function isRetiredRegistryRow(skillName, version) {
+  if (/\(retired\)/i.test(String(skillName || ""))) return true;
+  return String(version || "").trim().toLowerCase() === "retired";
+}
+
+// Skills that already lived under a malformed key are not new. A missing
+// Added date would gate them. 2026-10-08 is the original ship date.
+export const PREEXISTING_SKILL_ADDED = "2026-10-08";
+
+export function preservedAddedDate(notionAdded, legacyAdded, currentAdded, legacyKeyExisted) {
+  const notion = asIsoDate(notionAdded, "");
+  if (notion) return notion;
+  const legacy = asIsoDate(legacyAdded, "");
+  if (legacy) return legacy;
+  const current = asIsoDate(currentAdded, "");
+  if (current) return current;
+  if (legacyKeyExisted) return PREEXISTING_SKILL_ADDED;
+  return "";
 }
 
 export function templateTriggerFor(slug, rawTrigger) {
@@ -171,17 +212,21 @@ export function skillFromRegistryPage(props) {
   const instructions = notionPlainText(properties.Instructions).trim();
   const appliesTo = notionPlainText(properties["Applies to"]).trim().toLowerCase();
   const draftBox = properties.Draft && properties.Draft.checkbox === true;
+  const explicitVersion = notionPlainText(properties.Version).trim();
   if (isDraftSkill(skillName, draftBox)) return { skip: true, reason: "draft" };
-  const slug = triggerToSlug(rawTrigger);
+  if (isRetiredRegistryRow(skillName, explicitVersion)) return { skip: true, reason: "retired" };
+  // An explicit Slug property wins. Otherwise use the command words only.
+  const slug = sanitizeSlug(notionPlainText(properties.Slug)) || triggerToSlug(rawTrigger);
   if (!slug || !instructions || instructions.length < 20) return { skip: true, reason: "incomplete" };
   if (appliesTo && !appliesTo.includes("user") && !appliesTo.includes("all")) {
     return { skip: true, reason: "audience" };
   }
   const text = instructions.replace(/\bMike's\b/g, "the user's").replace(/\bMike\b/g, "the user");
-  const explicitVersion = notionPlainText(properties.Version).trim();
   return {
     skip: false,
+    name: skillName,
     slug: slug,
+    legacySlug: legacyTriggerToSlug(rawTrigger),
     match: templateTriggerFor(slug, rawTrigger),
     version: contentVersion(explicitVersion, text),
     explicitVersion: explicitVersion,

@@ -15,6 +15,10 @@ import {
   nextVersionMap,
   parseMachineBlock,
   renderUpdateEmail,
+  isRetiredRegistryRow,
+  legacyTriggerToSlug,
+  PREEXISTING_SKILL_ADDED,
+  preservedAddedDate,
   skillFromRegistryPage,
   templateTriggerFor,
   triggerToSlug,
@@ -260,6 +264,81 @@ describe("trigger form", () => {
     assert.equal(templateTriggerFor("my-tasks", "my tasks:"), "my tasks:");
     assert.equal(templateTriggerFor("complete-my-setup", "complete my setup"), "complete my setup");
     assert.equal(templateTriggerFor("results-for-me", ""), "results for me");
+  });
+
+  // Triggers checked against the seeded skill text and the live malformed keys.
+  // Old key is what the previous slug function wrote; new key is the command word.
+  const moved = [
+    ["archive: <numbers>", "archive:-<numbers>", "archive"],
+    ["archive: <number>", "archive:-<number>", "archive"],
+    ["unarchive: <number>", "unarchive:-<number>", "unarchive"],
+    ["Agent <name>: <prompt>", "agent-<name>:-<prompt>", "agent"],
+    ["my usage: 40%, resets Oct 9", "my-usage:-40%,-resets-oct-9", "my-usage"],
+    ["note strength: <observation>", "note-strength:-<observation>", "note-strength"],
+    ["session logging: <note>", "session-logging:-<note>", "session-logging"],
+    ["automatic (logit:)", "automatic-(logit:)", "automatic"],
+    ["automatic (log it:)", "automatic-(log-it:)", "automatic"],
+  ];
+
+  it("slugs only the command words and keeps a Slug property", () => {
+    for (const [trigger, oldKey, slug] of moved) {
+      assert.equal(legacyTriggerToSlug(trigger), oldKey, trigger);
+      assert.equal(triggerToSlug(trigger), slug, trigger);
+    }
+    assert.equal(triggerToSlug("quota board:"), "quota-board");
+    assert.equal(triggerToSlug("update fleet: <change>"), "update-fleet");
+    assert.equal(triggerToSlug("results for me"), "results-for-me");
+    assert.equal(triggerToSlug("help: <trigger> | details"), "help");
+
+    const instructions = "When the user says note strength: record the observation on the roster.";
+    const fromTrigger = skillFromRegistryPage({
+      Skill: title("Note strength"),
+      Trigger: rich("note strength: <observation>"),
+      Instructions: rich(instructions),
+    });
+    assert.equal(fromTrigger.slug, "note-strength");
+    assert.equal(fromTrigger.legacySlug, "note-strength:-<observation>");
+
+    const fromSlug = skillFromRegistryPage({
+      Skill: title("Note strength"),
+      Slug: rich("Note Strength"),
+      Trigger: rich("note: <observation>"),
+      Instructions: rich(instructions),
+    });
+    assert.equal(fromSlug.slug, "note-strength");
+    assert.equal(fromSlug.legacySlug, "note:-<observation>");
+  });
+
+  it("skips retired versions and retired names before they share a slug", () => {
+    assert.equal(isRetiredRegistryRow("Route", "retired"), true);
+    assert.equal(isRetiredRegistryRow("Route", "Retired"), true);
+    assert.equal(isRetiredRegistryRow("grok-bot-queue (retired)", "1.2"), true);
+    assert.equal(isRetiredRegistryRow("route (Retired)", "2"), true);
+    assert.equal(isRetiredRegistryRow("Route", "1.2"), false);
+
+    const instructions = "When the user says route: send the task to the right agent.";
+    const byVersion = skillFromRegistryPage({
+      Skill: title("Route"),
+      Trigger: rich("retired"),
+      Instructions: rich(instructions),
+      Version: { select: { name: "Retired" } },
+    });
+    assert.equal(byVersion.reason, "retired");
+    const byName = skillFromRegistryPage({
+      Skill: title("grok-bot-queue (retired)"),
+      Trigger: rich("grok bot queue:"),
+      Instructions: rich(instructions),
+      Version: rich("1.0"),
+    });
+    assert.equal(byName.reason, "retired");
+  });
+
+  it("keeps a moved skill's Added date, or treats a dateless prior key as not new", () => {
+    assert.equal(preservedAddedDate("2026-11-02", "2026-10-08", "", true), "2026-11-02");
+    assert.equal(preservedAddedDate("", "2026-10-01", "", true), "2026-10-01");
+    assert.equal(preservedAddedDate("", "", "2026-10-08", false), "2026-10-08");
+    assert.equal(preservedAddedDate("", "", "", true), PREEXISTING_SKILL_ADDED);
+    assert.equal(preservedAddedDate("", "", "", false), "");
   });
 });
 
@@ -1044,6 +1123,155 @@ describe("endpoints", () => {
     assert.equal(calls[0].text.includes(testKey), false);
     assert.equal(await kv.get("updates-sent:" + testKey), null);
     assert.ok(await kv.get("test:updates-sent:" + testKey));
+  });
+
+  it("moves malformed skill keys, drops retired and leftover kb keys, and stays quiet", async () => {
+    const kv = memoryKv();
+    const archiveBody = "When the user says archive: file that numbered task away now.";
+    const automaticBody = "When the user says automatic: keep every saved report in one layout.";
+    const queueBody = "When the user says grok bot queue: this retired row must not be stored.";
+    const routeBody = "When the user says route: this other retired row must not be stored.";
+    const secondArchive = "When the user says archive: a second row must not replace the first.";
+    await kv.put("skill:archive:-<numbers>", archiveBody);
+    await kv.put("skill-added:archive:-<numbers>", "2026-10-01");
+    await kv.put("skill-version:archive:-<numbers>", "1.0");
+    await kv.put("skill-record:archive:-<numbers>", JSON.stringify({ slug: "archive:-<numbers>" }));
+    await kv.put("skill:automatic-(logit:)", automaticBody);
+    await kv.put("skill-added:automatic-(logit:)", "");
+    await kv.put("skill:retired", queueBody);
+    await kv.put("skill-added:retired", "2026-10-08");
+    await kv.put("skill-index", JSON.stringify(["archive:-<numbers>", "automatic-(logit:)", "retired"]));
+    await kv.put("kb:kb001", "stale");
+    await kv.put("kb:kb002", "stale");
+    await kv.put("kb:kb003", "stale");
+    await kv.put("license:" + KEY, JSON.stringify(license()));
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    let puts = 0;
+    const origPut = kv.put.bind(kv);
+    kv.put = async (key, value) => { puts++; return origPut(key, value); };
+    const rows = [
+      {
+        properties: {
+          Skill: title("Archive"),
+          Trigger: rich("archive: <numbers>"),
+          Instructions: rich(archiveBody),
+          Version: rich("1.4"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("Archive again"),
+          Trigger: rich("archive: <number>"),
+          Instructions: rich(secondArchive),
+          Version: rich("9.9"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("Automatic"),
+          Trigger: rich("automatic (logit:)"),
+          Instructions: rich(automaticBody),
+          Version: rich("1.1"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("Unarchive"),
+          Trigger: rich("unarchive: <number>"),
+          Instructions: rich("When the user says unarchive: restore that numbered task."),
+          Version: rich("1.0"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("grok-bot-queue (retired)"),
+          Trigger: rich("retired"),
+          Instructions: rich(queueBody),
+          Version: rich("retired"),
+        },
+      },
+      {
+        properties: {
+          Skill: title("route (retired)"),
+          Trigger: rich("route:"),
+          Instructions: rich(routeBody),
+          Version: { select: { name: "Retired" } },
+        },
+      },
+    ];
+    let flip = false;
+    const env = testEnv(kv, {
+      fetch: async () => new Response(JSON.stringify({
+        results: flip ? rows.slice().reverse() : rows,
+        has_more: false,
+      }), { status: 200 }),
+    });
+    let first;
+    try {
+      first = await (await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(first.ok, true);
+    assert.equal(first.synced, 3);
+    assert.equal(first.collisions.length, 1);
+    assert.equal(first.collisions[0].slug, "archive");
+    assert.equal(first.collisions[0].kept, "Archive");
+    assert.equal(first.collisions[0].skipped, "Archive again");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /skill slug collision: "archive"/);
+    assert.deepEqual(first.migrations.map(row => row.from + " -> " + row.to).sort(), [
+      "archive:-<numbers> -> archive",
+      "automatic-(logit:) -> automatic",
+    ]);
+    assert.equal(await kv.get("skill:archive"), archiveBody);
+    assert.equal(await kv.get("skill-added:archive"), "2026-10-01");
+    assert.equal(await kv.get("skill-version:archive"), "1.4");
+    assert.equal(await kv.get("skill:automatic"), automaticBody);
+    assert.equal(await kv.get("skill-added:automatic"), PREEXISTING_SKILL_ADDED);
+    assert.equal(await kv.get("skill-added:unarchive"), "");
+    assert.equal(await kv.get("skill:archive:-<numbers>"), null);
+    assert.equal(await kv.get("skill-added:archive:-<numbers>"), null);
+    assert.equal(await kv.get("skill-version:archive:-<numbers>"), null);
+    assert.equal(await kv.get("skill-record:archive:-<numbers>"), null);
+    assert.equal(await kv.get("skill:automatic-(logit:)"), null);
+    assert.equal(await kv.get("skill:retired"), null);
+    assert.equal(await kv.get("skill-added:retired"), null);
+    assert.equal(await kv.get("kb:kb001"), null);
+    assert.equal(await kv.get("kb:kb002"), null);
+    assert.equal(await kv.get("kb:kb003"), null);
+    assert.equal(await kv.get("skill:unarchive"), "When the user says unarchive: restore that numbered task.");
+    const index = JSON.parse(await kv.get("skill-index"));
+    assert.deepEqual(index, ["archive", "automatic", "unarchive"]);
+    assert.deepEqual(JSON.parse(await kv.get("skill-deprecated") || "[]"), []);
+    assert.equal((await kv.get("skill:archive")).includes(secondArchive), false);
+
+    const envLive = testEnv(kv);
+    const archive = await worker.fetch(new Request(
+      "https://api.fleetlybots.com/api/skills/archive?key=" + encodeURIComponent(KEY)), envLive);
+    assert.equal(archive.status, 200);
+    const automatic = await worker.fetch(new Request(
+      "https://api.fleetlybots.com/api/skills/automatic?key=" + encodeURIComponent(KEY)), envLive);
+    assert.equal(automatic.status, 200);
+    const fresh = await worker.fetch(new Request(
+      "https://api.fleetlybots.com/api/skills/unarchive?key=" + encodeURIComponent(KEY)), envLive);
+    assert.equal(fresh.status, 403);
+    assert.equal((await fresh.json()).error, "membership_required");
+
+    puts = 0;
+    warnings.length = 0;
+    flip = true;
+    const second = await (await post(env, "/api/admin/sync-skills", {}, { "x-admin-secret": "s3cret" })).json();
+    assert.equal(second.puts, 0);
+    assert.equal(second.deleted, 0);
+    assert.equal(puts, 0);
+    assert.equal(second.collisions.length, 1);
+    assert.equal(warnings.length, 1);
+    assert.equal(await kv.get("skill-added:archive"), "2026-10-01");
+    assert.equal(await kv.get("skill-added:automatic"), PREEXISTING_SKILL_ADDED);
+    assert.equal(await kv.get("skill:archive"), archiveBody);
+    } finally {
+      console.warn = origWarn;
+    }
   });
 });
 
