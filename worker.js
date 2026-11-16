@@ -34,6 +34,8 @@ import {
   validEmail,
 } from "./updates.js";
 
+import { SETUP_MAP_BYTES } from "./setup-map-bytes.js";
+
 const SKILLS = {
  "agent": "Dispatch a task. When Mike says 'Agent <name>: <prompt>' (e.g. 'Agent muse: draft the memo', 'Agent Grok Bot: summarize this'): create a row in the AI Task Queue with Task=<about five words from the prompt>, Status=Routed, Assigned AI=<named AI>, Assigned by=<your own name, or Mike if Mike said it>, Priority=Medium (High/Low if he says so), Prompt=<the prompt verbatim>; confirm in one line: 'Sent to <AI>.' Any fleet member can be named, including Grok Bot \u2014 upward delegation works exactly like downward delegation. When he says 'Agent: <prompt>' (no name): recommend the best agent yourself \u2014 strength match from the AI Fleet roster first, then quota headroom vs reset from the Usage Log, then least recently used; never invent quota figures (if stale or missing, decide on strength alone and say so) \u2014 then present your recommendation PLUS the other suitable AIs as tappable choices (only AIs suitable for this task: strength match and quota headroom, no unsuitable options); dispatch to Mike's pick and confirm 'Sent to <AI> \u2014 your pick.' or 'Sent to <AI> \u2014 my recommendation.' Efficiency: prefer free-tier AIs for suitable tasks; reserve Grok for what only it does well (real-time X/news, heavy research, Finance connector). If the request looks wasteful for the remaining quota (oversized job, re-run of settled work), say so briefly and suggest the cheaper path before dispatching.",
  "deactivate": "When Mike says 'deactivate: <AI>' (removing an AI from active fleet use): 1) Rename its AI Fleet roster row to '<AI> (inactive)' and record why in its notes. 2) From then on, exclude it from 'Agent:' suggestions, rebalance moves, the quota board, and the 'fleet:' active list. 3) Keep its task history and usage log rows intact \u2014 nothing is deleted. 4) Confirm in one line what was deactivated and why.",
@@ -758,6 +760,8 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+const SETUP_MAP_URL = "https://api.fleetlybots.com/setup-map.png";
+
 function newPurchaseLicenseEmail(key) {
   const safeKey = escapeHtml(key);
   const html = `<!DOCTYPE html>
@@ -779,12 +783,13 @@ function newPurchaseLicenseEmail(key) {
 <p style="margin:0 0 28px 0; font-family:'DM Mono', 'Courier New', Courier, monospace; font-size:22px; line-height:1.4; font-weight:700; letter-spacing:2px; color:#11130f;">{{LICENSE_KEY}}</p>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#ef654c" style="border-radius:8px;"><a href="https://onboarding.fleetlybots.com" target="_blank" style="display:inline-block; padding:14px 28px; font-family:Manrope, Arial, Helvetica, sans-serif; font-size:16px; font-weight:700; color:#ffffff; text-decoration:none;">Start Fleetly</a></td></tr></table>
 <p style="margin:16px 0 0 0; font-size:13px; line-height:1.5; color:#555d54;">Or paste this link into your browser:<br><a href="https://onboarding.fleetlybots.com" target="_blank" style="color:#3f79dc; text-decoration:underline;">https://onboarding.fleetlybots.com</a></p>
+<p style="margin:8px 0 0 0; font-size:13px; line-height:1.5;"><a href="{{SETUP_MAP_URL}}" target="_blank" style="color:#3f79dc; text-decoration:underline;">See the setup map</a></p>
 <p style="margin:28px 0 0 0; font-size:15px; line-height:1.6; color:#11130f;">Questions? Reply to this email.</p>
 <p style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:#11130f;">— The Fleetly team</p>
 </td></tr></table>
 </td></tr></table>
 </body>
-</html>`.replace("{{LICENSE_KEY}}", () => safeKey);
+</html>`.replace("{{LICENSE_KEY}}", () => safeKey).replace("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL);
   const text = `Welcome to Fleetly.
 
 Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.
@@ -797,10 +802,12 @@ Your license key:
 Start Fleetly:
 https://onboarding.fleetlybots.com
 
+See the setup map: {{SETUP_MAP_URL}}
+
 Questions? Reply to this email.
 
 — The Fleetly team
-`.replace("{{LICENSE_KEY}}", () => String(key));
+`.replace("{{LICENSE_KEY}}", () => String(key)).replace("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL);
   return { html, text };
 }
 
@@ -1601,6 +1608,15 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
+    if (request.method === "GET" && path === new URL(SETUP_MAP_URL).pathname) {
+      return new Response(SETUP_MAP_BYTES, {
+        headers: {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=86400",
+        },
+      });
+    }
+
     if (path === "/api/health" || path === "/") {
       return json({ ok: true, service: "fleetly-api" });
     }
@@ -1726,4 +1742,4 @@ export default {
   },
 };
 
-export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN, newPurchaseLicenseEmail };
+export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN, newPurchaseLicenseEmail, SETUP_MAP_URL };

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import worker, { newPurchaseLicenseEmail } from "../worker.js";
+import worker, { newPurchaseLicenseEmail, SETUP_MAP_URL } from "../worker.js";
 import {
   cancellationHtml,
   classifyRefund,
@@ -535,9 +536,12 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(emails[0].subject, "Welcome to Fleetly — your license key");
     assert.equal(emails[0].reply_to, "Fleetly Support <support@fleetlybots.com>");
     assert.equal(emails[0].html.includes("{{LICENSE_KEY}}"), false);
-    assert.equal(emails[0].html.includes("fleetlybots.com/setup"), false);
+    assert.equal(emails[0].html.includes("https://fleetlybots.com/setup"), false);
     assert.equal(emails[0].html.includes(">" + key + "</p>"), true);
     assert.equal(emails[0].html.includes('href="https://onboarding.fleetlybots.com"'), true);
+    assert.equal(emails[0].html.includes('href="' + SETUP_MAP_URL + '"'), true);
+    assert.equal(emails[0].html.includes(">See the setup map</a>"), true);
+    assert.ok(emails[0].html.indexOf("Or paste this link into your browser:") < emails[0].html.indexOf("See the setup map"));
     assert.equal(emails[0].text, [
       "Welcome to Fleetly.",
       "",
@@ -550,6 +554,8 @@ describe("licensing hardening", { concurrency: false }, () => {
       "",
       "Start Fleetly:",
       "https://onboarding.fleetlybots.com",
+      "",
+      "See the setup map: " + SETUP_MAP_URL,
       "",
       "Questions? Reply to this email.",
       "",
@@ -571,8 +577,20 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(emails[1].text, undefined);
     assert.equal(emails[1].reply_to, undefined);
     assert.equal(emails[1].html.includes("onboarding.fleetlybots.com"), false);
+    assert.equal(emails[1].html.includes("setup-map.png"), false);
     assert.equal(emails[1].html.includes("<strong>" + key + "</strong>"), true);
     assert.match(emails[1].html, /Your Fleetly membership is active — your license now stays current/);
+  });
+
+  it("serves the setup map PNG", async () => {
+    const png = readFileSync(new URL("../public/setup-map.png", import.meta.url));
+    const res = await worker.fetch(new Request(SETUP_MAP_URL));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "image/png");
+    assert.equal(res.headers.get("cache-control"), "public, max-age=86400");
+    const body = Buffer.from(await res.arrayBuffer());
+    assert.equal(body.equals(png), true);
+    assert.equal(body.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   });
 
   it("escapes the license key in the welcome HTML", () => {
