@@ -822,6 +822,7 @@ async function sendKeyEmail(env, email, key, plan, isNew, testMode) {
     const welcome = newPurchaseLicenseEmail(key);
     payload.html = welcome.html;
     payload.text = welcome.text;
+    payload.reply_to = "Fleetly Support <support@fleetlybots.com>";
   }
   try {
     const r = await http(env)("https://api.resend.com/emails", {

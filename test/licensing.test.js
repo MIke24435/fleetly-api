@@ -533,7 +533,7 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(emails.length, 1);
     assert.equal(emails[0].from, "Fleetly <hello@fleetlybots.com>");
     assert.equal(emails[0].subject, "Welcome to Fleetly — your license key");
-    assert.equal(emails[0].reply_to, undefined);
+    assert.equal(emails[0].reply_to, "Fleetly Support <support@fleetlybots.com>");
     assert.equal(emails[0].html.includes("{{LICENSE_KEY}}"), false);
     assert.equal(emails[0].html.includes("fleetlybots.com/setup"), false);
     assert.equal(emails[0].html.includes(">" + key + "</p>"), true);
