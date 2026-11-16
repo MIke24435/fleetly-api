@@ -749,27 +749,80 @@ async function verifyStripeSig(rawBody, sigHeader, secret) {
   return timedEqual(hex, parts.v1);
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function newPurchaseLicenseEmail(key) {
+  const safeKey = escapeHtml(key);
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to Fleetly — your license key</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f7f8f3;">
+<div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">Your Fleetly license key is ready. Open the onboarding form to get started.</div>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f7f8f3;"><tr><td align="center" style="padding:32px 16px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="width:560px; max-width:560px; background-color:#ffffff; border:1px solid #c9cec3; border-radius:12px;"><tr><td style="padding:36px 36px 32px 36px; font-family:Manrope, Arial, Helvetica, sans-serif; color:#11130f;">
+<p style="margin:0 0 8px 0; font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:#555d54; font-weight:700;">Fleetly</p>
+<h1 style="margin:0 0 20px 0; font-size:24px; line-height:1.3; font-weight:800; color:#11130f;">Welcome to Fleetly</h1>
+<p style="margin:0 0 14px 0; font-size:16px; line-height:1.6; color:#11130f;">Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.</p>
+<p style="margin:0 0 24px 0; font-size:16px; line-height:1.6; color:#11130f;">Your license key is below. Next, open the onboarding form. It includes the Fleetly Notion template and Fleetly bot links, and it will walk you through setup.</p>
+<p style="margin:0 0 8px 0; font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:#555d54; font-weight:700;">Your license key</p>
+<p style="margin:0 0 28px 0; font-family:'DM Mono', 'Courier New', Courier, monospace; font-size:22px; line-height:1.4; font-weight:700; letter-spacing:2px; color:#11130f;">{{LICENSE_KEY}}</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#ef654c" style="border-radius:8px;"><a href="https://onboarding.fleetlybots.com" target="_blank" style="display:inline-block; padding:14px 28px; font-family:Manrope, Arial, Helvetica, sans-serif; font-size:16px; font-weight:700; color:#ffffff; text-decoration:none;">Start Fleetly</a></td></tr></table>
+<p style="margin:16px 0 0 0; font-size:13px; line-height:1.5; color:#555d54;">Or paste this link into your browser:<br><a href="https://onboarding.fleetlybots.com" target="_blank" style="color:#3f79dc; text-decoration:underline;">https://onboarding.fleetlybots.com</a></p>
+<p style="margin:28px 0 0 0; font-size:15px; line-height:1.6; color:#11130f;">Questions? Reply to this email.</p>
+<p style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:#11130f;">— The Fleetly team</p>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>`.replace("{{LICENSE_KEY}}", () => safeKey);
+  const text = `Welcome to Fleetly.
+
+Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.
+
+Your license key is below. Next, open the onboarding form. It includes the Fleetly Notion template and Fleetly bot links, and it will walk you through setup.
+
+Your license key:
+{{LICENSE_KEY}}
+
+Start Fleetly:
+https://onboarding.fleetlybots.com
+
+Questions? Reply to this email.
+
+— The Fleetly team
+`.replace("{{LICENSE_KEY}}", () => String(key));
+  return { html, text };
+}
+
 async function sendKeyEmail(env, email, key, plan, isNew, testMode) {
   if (!env.RESEND_API_KEY || !email) return { sent: false, reason: "no_api_key_or_email" };
   const isMembershipRenewal = plan === "membership" && !isNew;
-  const productLine = plan === "membership"
-    ? "Fleetly membership — ongoing updates ($6/month)"
-    : "Fleetly custom Notion template ($49, includes 6 months of updates)";
-  const html = isMembershipRenewal ? `
+  const payload = {
+    from: "Fleetly <hello@fleetlybots.com>",
+    to: [email],
+    subject: (testMode ? "[TEST] " : "") + (isMembershipRenewal
+      ? "Your Fleetly membership is active"
+      : "Welcome to Fleetly — your license key"),
+  };
+  if (isMembershipRenewal) {
+    payload.html = `
     <p>Your Fleetly membership is active — your license now stays current as long as you're subscribed. No new key needed; keep using <strong>${key}</strong>.</p>
-    <p>— The Fleetly team</p>` : `
-    <p>Your Fleetly license key is ready:</p>
-    <p style="font-size:20px;font-weight:bold;letter-spacing:2px;">${key}</p>
-    <p><strong>What you bought:</strong> ${productLine}</p>
-    <p><strong>Setup (3 steps):</strong></p>
-    <ol>
-      <li>Duplicate the Fleetly template into your Notion (link below).</li>
-      <li>Paste your key into the "Fleetly license key" field on your Fleetly home page.</li>
-      <li>Tell your AI assistant to fetch its instructions — it will use your key automatically.</li>
-    </ol>
-    <p>Template: https://fleetlybots.com/setup</p>
-    <p>Questions? Reply to this email.</p>
     <p>— The Fleetly team</p>`;
+  } else {
+    const welcome = newPurchaseLicenseEmail(key);
+    payload.html = welcome.html;
+    payload.text = welcome.text;
+  }
   try {
     const r = await http(env)("https://api.resend.com/emails", {
       method: "POST",
@@ -777,12 +830,7 @@ async function sendKeyEmail(env, email, key, plan, isNew, testMode) {
         "Authorization": "Bearer " + env.RESEND_API_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        from: "Fleetly <hello@fleetlybots.com>",
-        to: [email],
-        subject: (testMode ? "[TEST] " : "") + (isMembershipRenewal ? "Your Fleetly membership is active" : "Your Fleetly license key"),
-        html: html,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!r.ok) return { sent: false, reason: "resend_" + r.status };
     return { sent: true };
@@ -1677,4 +1725,4 @@ export default {
   },
 };
 
-export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN };
+export { REGISTRY_QUERY_DB, REGISTRY_DB_MISMATCH, MEMBERSHIP_REQUIRED_NOTE, UPDATE_BEGIN, newPurchaseLicenseEmail };
