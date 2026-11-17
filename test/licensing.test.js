@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import worker from "../worker.js";
+import worker, { newPurchaseLicenseEmail, SETUP_MAP_URL } from "../worker.js";
 import {
   cancellationHtml,
   classifyRefund,
@@ -267,7 +268,9 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(await kv.get("license-customer:cus_rotate"), body.key);
     assert.equal(emails.length, 1);
     assert.match(emails[0].html, new RegExp(body.key));
+    assert.match(emails[0].text, new RegExp(body.key));
     assert.equal(emails[0].html.includes(oldKey), false);
+    assert.equal(emails[0].text.includes(oldKey), false);
     const looked = await (await postJson(env, "/api/admin/lookup", { key: oldKey }, { "x-admin-secret": ADMIN })).json();
     assert.equal(JSON.stringify(looked).includes(body.key), false);
     assert.equal(looked.rotated_to_ending, body.license_ending);
@@ -513,6 +516,89 @@ describe("licensing hardening", { concurrency: false }, () => {
     const second = await postWebhook(env, event, LIVE_SECRET);
     assert.equal((await second.json()).deduped, true);
     assert.equal(calls, 1);
+  });
+
+  it("sends the welcome license email on a new purchase and leaves renewal mail unchanged", async () => {
+    const kv = memoryKv();
+    const emails = [];
+    const env = testEnv(kv, {
+      fetch: async (url, init) => {
+        if (String(url).includes("api.resend.com")) emails.push(JSON.parse(init.body));
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const welcomeEvent = checkoutEvent({ event: { id: "evt_welcome" } });
+    welcomeEvent.id = "evt_welcome";
+    assert.equal((await postWebhook(env, welcomeEvent, LIVE_SECRET)).status, 200);
+    const key = await kv.get("license-email:buyer@example.com");
+    assert.equal(emails.length, 1);
+    assert.equal(emails[0].from, "Fleetly <hello@fleetlybots.com>");
+    assert.equal(emails[0].subject, "Welcome to Fleetly — your license key");
+    assert.equal(emails[0].reply_to, "Fleetly Support <support@fleetlybots.com>");
+    assert.equal(emails[0].html.includes("{{LICENSE_KEY}}"), false);
+    assert.equal(emails[0].html.includes("https://fleetlybots.com/setup"), false);
+    assert.equal(emails[0].html.includes(">" + key + "</p>"), true);
+    assert.equal(emails[0].html.includes('href="https://onboarding.fleetlybots.com"'), true);
+    assert.equal(emails[0].html.includes('href="' + SETUP_MAP_URL + '"'), true);
+    assert.equal(emails[0].html.includes(">See the setup map</a>"), true);
+    assert.ok(emails[0].html.indexOf("Or paste this link into your browser:") < emails[0].html.indexOf("See the setup map"));
+    assert.equal(emails[0].text, [
+      "Welcome to Fleetly.",
+      "",
+      "Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.",
+      "",
+      "Your license key is below. Next, open the onboarding form. It includes the Fleetly Notion template and Fleetly bot links, and it will walk you through setup.",
+      "",
+      "Your license key:",
+      key,
+      "",
+      "Start Fleetly:",
+      "https://onboarding.fleetlybots.com",
+      "",
+      "See the setup map: " + SETUP_MAP_URL,
+      "",
+      "Questions? Reply to this email.",
+      "",
+      "— The Fleetly team",
+      "",
+    ].join("\n"));
+
+    const renewalEvent = checkoutEvent({
+      event: { id: "evt_renew" },
+      id: "cs_live_renew",
+      mode: "subscription",
+      subscription: "sub_renew",
+    });
+    renewalEvent.id = "evt_renew";
+    assert.equal((await postWebhook(env, renewalEvent, LIVE_SECRET)).status, 200);
+    assert.equal(emails.length, 2);
+    assert.equal(emails[1].from, "Fleetly <hello@fleetlybots.com>");
+    assert.equal(emails[1].subject, "Your Fleetly membership is active");
+    assert.equal(emails[1].text, undefined);
+    assert.equal(emails[1].reply_to, undefined);
+    assert.equal(emails[1].html.includes("onboarding.fleetlybots.com"), false);
+    assert.equal(emails[1].html.includes("setup-map.png"), false);
+    assert.equal(emails[1].html.includes("<strong>" + key + "</strong>"), true);
+    assert.match(emails[1].html, /Your Fleetly membership is active — your license now stays current/);
+  });
+
+  it("serves the setup map PNG", async () => {
+    const png = readFileSync(new URL("../public/setup-map.png", import.meta.url));
+    const res = await worker.fetch(new Request(SETUP_MAP_URL));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "image/png");
+    assert.equal(res.headers.get("cache-control"), "public, max-age=86400");
+    const body = Buffer.from(await res.arrayBuffer());
+    assert.equal(body.equals(png), true);
+    assert.equal(body.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  });
+
+  it("escapes the license key in the welcome HTML", () => {
+    const key = `FL-A&B<"'>`;
+    const mail = newPurchaseLicenseEmail(key);
+    assert.equal(mail.html.includes(key), false);
+    assert.equal(mail.html.includes("FL-A&amp;B&lt;&quot;&#39;&gt;"), true);
+    assert.equal(mail.text.includes(key), true);
   });
 });
 
