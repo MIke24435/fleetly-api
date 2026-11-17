@@ -539,6 +539,11 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(emails[0].html.includes("https://fleetlybots.com/setup"), false);
     assert.equal(emails[0].html.includes(">" + key + "</p>"), true);
     assert.equal(emails[0].html.includes('href="https://onboarding.fleetlybots.com"'), true);
+    assert.equal(emails[0].html.includes('href="https://template.fleetlybots.com"'), true);
+    assert.equal(emails[0].html.includes(">https://template.fleetlybots.com</a>"), true);
+    assert.equal(emails[0].html.includes("Start with the onboarding form. It tells you when to duplicate the template."), true);
+    assert.ok(emails[0].html.indexOf(">" + key + "</p>") < emails[0].html.indexOf("Your Fleetly Notion Template:"));
+    assert.ok(emails[0].html.indexOf("Your Fleetly Notion Template:") < emails[0].html.indexOf(">Start Fleetly</a>"));
     assert.equal(emails[0].html.includes('href="' + SETUP_MAP_URL + '"'), true);
     assert.equal(emails[0].html.includes(">See the setup map</a>"), true);
     assert.ok(emails[0].html.indexOf("Or paste this link into your browser:") < emails[0].html.indexOf("See the setup map"));
@@ -551,6 +556,9 @@ describe("licensing hardening", { concurrency: false }, () => {
       "",
       "Your license key:",
       key,
+      "",
+      "Your Fleetly Notion Template: https://template.fleetlybots.com",
+      "Start with the onboarding form. It tells you when to duplicate the template.",
       "",
       "Start Fleetly:",
       "https://onboarding.fleetlybots.com",
@@ -578,6 +586,8 @@ describe("licensing hardening", { concurrency: false }, () => {
     assert.equal(emails[1].reply_to, undefined);
     assert.equal(emails[1].html.includes("onboarding.fleetlybots.com"), false);
     assert.equal(emails[1].html.includes("setup-map.png"), false);
+    assert.equal(emails[1].html.includes("template.fleetlybots.com"), false);
+    assert.equal(emails[1].html.includes("Start with the onboarding form."), false);
     assert.equal(emails[1].html.includes("<strong>" + key + "</strong>"), true);
     assert.match(emails[1].html, /Your Fleetly membership is active — your license now stays current/);
   });
