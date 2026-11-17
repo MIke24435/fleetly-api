@@ -761,6 +761,7 @@ function escapeHtml(value) {
 }
 
 const SETUP_MAP_URL = "https://api.fleetlybots.com/setup-map.png";
+const NOTION_TEMPLATE_URL = "https://template.fleetlybots.com";
 
 function newPurchaseLicenseEmail(key) {
   const safeKey = escapeHtml(key);
@@ -780,7 +781,9 @@ function newPurchaseLicenseEmail(key) {
 <p style="margin:0 0 14px 0; font-size:16px; line-height:1.6; color:#11130f;">Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.</p>
 <p style="margin:0 0 24px 0; font-size:16px; line-height:1.6; color:#11130f;">Your license key is below. Next, open the onboarding form. It includes the Fleetly Notion template and Fleetly bot links, and it will walk you through setup.</p>
 <p style="margin:0 0 8px 0; font-size:12px; letter-spacing:0.12em; text-transform:uppercase; color:#555d54; font-weight:700;">Your license key</p>
-<p style="margin:0 0 28px 0; font-family:'DM Mono', 'Courier New', Courier, monospace; font-size:22px; line-height:1.4; font-weight:700; letter-spacing:2px; color:#11130f;">{{LICENSE_KEY}}</p>
+<p style="margin:0 0 16px 0; font-family:'DM Mono', 'Courier New', Courier, monospace; font-size:22px; line-height:1.4; font-weight:700; letter-spacing:2px; color:#11130f;">{{LICENSE_KEY}}</p>
+<p style="margin:0 0 14px 0; font-size:16px; line-height:1.6; color:#11130f;">Your Fleetly Notion Template: <a href="{{NOTION_TEMPLATE_URL}}" target="_blank" style="color:#3f79dc; text-decoration:underline;">{{NOTION_TEMPLATE_URL}}</a></p>
+<p style="margin:0 0 28px 0; font-size:16px; line-height:1.6; color:#11130f;">Start with the onboarding form. It tells you when to duplicate the template.</p>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#ef654c" style="border-radius:8px;"><a href="https://onboarding.fleetlybots.com" target="_blank" style="display:inline-block; padding:14px 28px; font-family:Manrope, Arial, Helvetica, sans-serif; font-size:16px; font-weight:700; color:#ffffff; text-decoration:none;">Start Fleetly</a></td></tr></table>
 <p style="margin:16px 0 0 0; font-size:13px; line-height:1.5; color:#555d54;">Or paste this link into your browser:<br><a href="https://onboarding.fleetlybots.com" target="_blank" style="color:#3f79dc; text-decoration:underline;">https://onboarding.fleetlybots.com</a></p>
 <p style="margin:8px 0 0 0; font-size:13px; line-height:1.5;"><a href="{{SETUP_MAP_URL}}" target="_blank" style="color:#3f79dc; text-decoration:underline;">See the setup map</a></p>
@@ -789,7 +792,7 @@ function newPurchaseLicenseEmail(key) {
 </td></tr></table>
 </td></tr></table>
 </body>
-</html>`.replace("{{LICENSE_KEY}}", () => safeKey).replace("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL);
+</html>`.replace("{{LICENSE_KEY}}", () => safeKey).replaceAll("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL).replaceAll("{{NOTION_TEMPLATE_URL}}", () => escapeHtml(NOTION_TEMPLATE_URL));
   const text = `Welcome to Fleetly.
 
 Fleetly is a Notion workspace that lets you run a team of AIs — Claude, ChatGPT, Muse, and Grok Bot — from one place, with shared memory and clear handoffs.
@@ -799,6 +802,9 @@ Your license key is below. Next, open the onboarding form. It includes the Fleet
 Your license key:
 {{LICENSE_KEY}}
 
+Your Fleetly Notion Template: {{NOTION_TEMPLATE_URL}}
+Start with the onboarding form. It tells you when to duplicate the template.
+
 Start Fleetly:
 https://onboarding.fleetlybots.com
 
@@ -807,7 +813,7 @@ See the setup map: {{SETUP_MAP_URL}}
 Questions? Reply to this email.
 
 — The Fleetly team
-`.replace("{{LICENSE_KEY}}", () => String(key)).replace("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL);
+`.replace("{{LICENSE_KEY}}", () => String(key)).replaceAll("{{SETUP_MAP_URL}}", () => SETUP_MAP_URL).replaceAll("{{NOTION_TEMPLATE_URL}}", () => NOTION_TEMPLATE_URL);
   return { html, text };
 }
 
